@@ -724,6 +724,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
     ):
         self.SEG_START = None
         self.seg_output_embeddings = []
+        kwargs.pop("mm_token_type_ids", None)
         outputs = self.generate(**kwargs)
         input_ids = kwargs["input_ids"]
         output_ids = outputs.sequences
@@ -845,15 +846,15 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 )
                 model_inputs["attention_mask"] = attention_mask_2d
 
-            cache_position = model_inputs.get("cache_position")
-            if cache_position is not None:
-                start_position = cache_position[0]
+            current_cache_position = model_inputs.get("cache_position")
+            if current_cache_position is not None:
+                start_position = current_cache_position[0]
                 query_len = model_inputs["inputs_embeds"].shape[1]
                 model_inputs["cache_position"] = torch.arange(
                     start_position,
                     start_position + query_len,
-                    device=cache_position.device,
-                    dtype=cache_position.dtype,
+                    device=current_cache_position.device,
+                    dtype=current_cache_position.dtype,
                 )
 
         attention_mask_2d = model_inputs.get("attention_mask")
@@ -863,7 +864,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             and attention_mask_2d.ndim == 2
         ):
             current_input_length = model_inputs["inputs_embeds"].shape[1]
-            model_inputs["attention_mask"] = full_attn_mask(
+            model_inputs["attention_mask"] = fused_full_attn_mask(
                 current_input_length, attention_mask_2d.shape[1], attention_mask_2d
             )
 
@@ -893,7 +894,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
     ) -> dict[str, Any]:
         seg_start = self.SEG_START
         if seg_start is not None:
-            self.seg_output_embeddings.append(outputs['hidden_states'][-1][:,2:-1]) # except the start and end token 
+            self.seg_output_embeddings.append(outputs['hidden_states'][-1][:, 2:-1])
 
         model_kwargs = super()._update_model_kwargs_for_generation(
             outputs=outputs,
@@ -901,5 +902,35 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             is_encoder_decoder=is_encoder_decoder,
             num_new_tokens=num_new_tokens
         )
- 
+
+        if seg_start is not None:
+            attention_mask = model_kwargs.get("attention_mask")
+            past_key_values = model_kwargs.get("past_key_values")
+            if (
+                attention_mask is not None
+                and attention_mask.ndim == 2
+                and past_key_values is not None
+            ):
+                past_seq_len = past_key_values.get_seq_length()
+                missing_len = past_seq_len - attention_mask.shape[-1]
+                if missing_len > 0:
+                    model_kwargs["attention_mask"] = torch.cat(
+                        [
+                            attention_mask,
+                            attention_mask.new_ones((attention_mask.shape[0], missing_len)),
+                        ],
+                        dim=-1,
+                    )
+
+            cache_position = model_kwargs.get("cache_position")
+            if cache_position is not None and past_key_values is not None:
+                next_input_len = cache_position.shape[0]
+                start_position = past_key_values.get_seq_length()
+                model_kwargs["cache_position"] = torch.arange(
+                    start_position,
+                    start_position + next_input_len,
+                    device=cache_position.device,
+                    dtype=cache_position.dtype,
+                )
+
         return model_kwargs

@@ -162,6 +162,7 @@ class VideoEvalDataset(Dataset):
 
             data_list_new.append(
                 {
+                    "global_idx": data.get("global_idx"),
                     "video_path": video_abs_path,
                     "instruction": instruction,
                     "phrase": phrase,
@@ -224,7 +225,7 @@ class VideoEvalDataset(Dataset):
             video_resource = data["video_path"]
 
         return {
-            "idx": idx,
+            "idx": data["global_idx"] if data["global_idx"] is not None else idx,
             "instruction": data["instruction"],
             "phrase": data["phrase"],
             "gt_masks": gt_masks,
@@ -240,6 +241,9 @@ def collate_fn(batch):
 
 def build_eval_dataloader(args, distributed):
     questions = json.load(open(args.question_file))
+    for idx, question in enumerate(questions):
+        if "global_idx" not in question:
+            question["global_idx"] = idx
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     dataset = VideoEvalDataset(args.video_folder, questions)
     sampler = (
@@ -265,21 +269,49 @@ def save_results(result, save_path):
     j = sum(item["j"] for item in result) / len(result)
     f = sum(item["f"] for item in result) / len(result)
     metrics = {"j": j, "f": f, "j&f": (j + f) / 2}
-    result.insert(0, metrics)
+    payload = [metrics] + list(result)
 
     save_dir = os.path.dirname(save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
     if save_path.endswith(".json"):
         with open(save_path, "w") as f:
-            json.dump(result, f, indent=4)
+            json.dump(payload, f, indent=4)
     elif save_path.endswith(".jsonl"):
         with open(save_path, "w") as f:
-            for info in result:
+            for info in payload:
                 f.write(json.dumps(info) + "\n")
     else:
         raise ValueError("Unsupported file format.")
     print(f"Answer saved at:{save_path}")
+
+
+def save_error_log(failed_samples, save_path):
+    if not failed_samples:
+        return
+    with open(save_path, "w") as f:
+        json.dump(failed_samples, f, indent=4, ensure_ascii=False)
+
+
+def save_progress(results, failed_samples, output_file, processed_count, total_count):
+    save_results(results, output_file)
+
+    error_path = str(Path(output_file).with_suffix("")) + "_errors.json"
+    save_error_log(failed_samples, error_path)
+
+    progress_path = str(Path(output_file).with_suffix("")) + "_progress.json"
+    with open(progress_path, "w") as f:
+        json.dump(
+            {
+                "processed": processed_count,
+                "total": total_count,
+                "completed": processed_count >= total_count,
+                "results_saved_to": output_file,
+                "errors_saved_to": error_path if failed_samples else None,
+            },
+            f,
+            indent=4,
+        )
 
 
 def init_distributed():
@@ -378,85 +410,119 @@ def run_inference(args):
 
     results = []
     failed_samples = []
-    for batch in tqdm(
-        val_loader,
-        desc=f"Rank {global_rank}",
-        total=len(val_loader),
-        position=local_rank,
-    ):
-        for sample in batch:
-            gt_masks = np.asarray(sample["gt_masks"]).astype(bool)
-            h, w = gt_masks.shape[1], gt_masks.shape[2]
-            output_text = ""
-            video_results = None
-            error_message = None
-            pred_masks = None
+    total_samples = len(val_loader.dataset)
+    processed_count = 0
 
-            try:
-                output_text, pred_masks, video_results = run_single_inference(
-                    sample, processor, tokenizer, model, video_seg_engine, args
-                )
+    try:
+        for batch in tqdm(
+            val_loader,
+            desc=f"Rank {global_rank}",
+            total=len(val_loader),
+            position=local_rank,
+        ):
+            for sample in batch:
+                gt_masks = np.asarray(sample["gt_masks"]).astype(bool)
+                h, w = gt_masks.shape[1], gt_masks.shape[2]
+                output_text = ""
+                video_results = None
+                error_message = None
+                pred_masks = None
 
-                if pred_masks is None:
-                    raise RuntimeError(
-                        "Aggregated video masks are empty for sample "
-                        f"{sample['idx']} ({sample['video_path']})."
+                try:
+                    output_text, pred_masks, video_results = run_single_inference(
+                        sample, processor, tokenizer, model, video_seg_engine, args
                     )
 
-                pred_masks = [
-                    np.zeros((h, w), dtype=bool) if mask is None else mask.astype(bool)
-                    for mask in pred_masks
-                ]
-                pred_masks = np.asarray(pred_masks)
-                pred_masks = resize_pred_masks_if_needed(pred_masks, h, w)
+                    if pred_masks is None:
+                        raise RuntimeError(
+                            "Aggregated video masks are empty for sample "
+                            f"{sample['idx']} ({sample['video_path']})."
+                        )
 
-                if gt_masks.shape[0] == pred_masks.shape[0]:
-                    j = db_eval_iou(gt_masks, pred_masks).mean()
-                    f = db_eval_boundary(gt_masks, pred_masks).mean()
-                else:
+                    pred_masks = [
+                        np.zeros((h, w), dtype=bool) if mask is None else mask.astype(bool)
+                        for mask in pred_masks
+                    ]
+                    pred_masks = np.asarray(pred_masks)
+                    pred_masks = resize_pred_masks_if_needed(pred_masks, h, w)
+
+                    if gt_masks.shape[0] == pred_masks.shape[0]:
+                        j = db_eval_iou(gt_masks, pred_masks).mean()
+                        f = db_eval_boundary(gt_masks, pred_masks).mean()
+                    else:
+                        print(
+                            f"Data {sample['idx']}: GT frames ({gt_masks.shape[0]}) != Pred frames ({pred_masks.shape[0]}), "
+                            "skip intermediate eval"
+                        )
+                        raise RuntimeError(
+                            f"GT/pred frame mismatch: {gt_masks.shape[0]} vs {pred_masks.shape[0]}"
+                        )
+                except Exception as exc:
+                    error_message = str(exc)
+                    failed_samples.append(
+                        {
+                            "idx": sample["idx"],
+                            "video_path": sample["video_path"],
+                            "instruction": sample["instruction"],
+                            "phrase": sample["phrase"],
+                            "prediction": output_text,
+                            "error": error_message,
+                        }
+                    )
                     print(
-                        f"Data {sample['idx']}: GT frames ({gt_masks.shape[0]}) != Pred frames ({pred_masks.shape[0]}), "
-                        "skip intermediate eval"
+                        f"[WARN] Sample {sample['idx']} failed and will be scored as zero: "
+                        f"{sample['video_path']} | {error_message}"
                     )
-                    raise RuntimeError(
-                        f"GT/pred frame mismatch: {gt_masks.shape[0]} vs {pred_masks.shape[0]}"
-                    )
-            except Exception as exc:
-                error_message = str(exc)
-                failed_samples.append(
+                    pred_masks = np.zeros_like(gt_masks, dtype=bool)
+                    j = 0.0
+                    f = 0.0
+                mask_rles = [
+                    single_mask_to_rle(pred_mask.astype(np.uint8)) for pred_mask in pred_masks
+                ]
+
+                results.append(
                     {
                         "idx": sample["idx"],
-                        "video_path": sample["video_path"],
                         "instruction": sample["instruction"],
-                        "phrase": sample["phrase"],
                         "prediction": output_text,
+                        "j": float(j),
+                        "f": float(f),
+                        "mask_rle": mask_rles,
+                        "video_path": sample["video_path"],
+                        "num_segments": 0 if video_results is None else len(video_results),
                         "error": error_message,
                     }
                 )
-                print(
-                    f"[WARN] Sample {sample['idx']} failed and will be scored as zero: "
-                    f"{sample['video_path']} | {error_message}"
-                )
-                pred_masks = np.zeros_like(gt_masks, dtype=bool)
-                j = 0.0
-                f = 0.0
-            mask_rles = [
-                single_mask_to_rle(pred_mask.astype(np.uint8)) for pred_mask in pred_masks
-            ]
+                processed_count += 1
 
-            results.append(
-                {
-                    "idx": sample["idx"],
-                    "instruction": sample["instruction"],
-                    "prediction": output_text,
-                    "j": float(j),
-                    "f": float(f),
-                    "mask_rle": mask_rles,
-                    "video_path": sample["video_path"],
-                    "num_segments": 0 if video_results is None else len(video_results),
-                    "error": error_message,
-                }
+                if (
+                    not distributed
+                    and args.save_every > 0
+                    and processed_count % args.save_every == 0
+                ):
+                    save_progress(
+                        results,
+                        failed_samples,
+                        args.output_file,
+                        processed_count,
+                        total_samples,
+                    )
+                    print(
+                        f"Checkpoint saved after {processed_count}/{total_samples} samples."
+                    )
+    except KeyboardInterrupt:
+        if not distributed and len(results) > 0:
+            save_progress(
+                results,
+                failed_samples,
+                args.output_file,
+                processed_count,
+                total_samples,
             )
+            print(
+                f"Interrupted. Partial results saved for {processed_count}/{total_samples} samples."
+            )
+        raise
 
     if distributed:
         gathered_results = [None for _ in range(dist.get_world_size())]
@@ -467,18 +533,22 @@ def run_inference(args):
         )
         if global_rank == 0:
             results = sum(gathered_results, [])
-            save_results(results, args.output_file)
-            if failed_samples:
-                error_path = str(Path(args.output_file).with_suffix("")) + "_errors.json"
-                with open(error_path, "w") as f:
-                    json.dump(failed_samples, f, indent=4, ensure_ascii=False)
+            save_progress(
+                results,
+                failed_samples,
+                args.output_file,
+                len(results),
+                len(results),
+            )
         dist.destroy_process_group()
     else:
-        save_results(results, args.output_file)
-        if failed_samples:
-            error_path = str(Path(args.output_file).with_suffix("")) + "_errors.json"
-            with open(error_path, "w") as f:
-                json.dump(failed_samples, f, indent=4, ensure_ascii=False)
+        save_progress(
+            results,
+            failed_samples,
+            args.output_file,
+            processed_count,
+            total_samples,
+        )
 
 
 def parse_args():
@@ -497,6 +567,7 @@ def parse_args():
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--max-frames", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--max-frame-num-to-track", type=int, default=None)
     parser.add_argument(
