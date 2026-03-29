@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -74,6 +75,24 @@ def infer_phrase_from_instruction(instruction):
     return None
 
 
+def ensure_segmentation_mask_request(instruction):
+    suffix = "Please output the segmentation mask."
+    stripped = instruction.strip()
+    if suffix.lower() in stripped.lower():
+        return stripped
+    return f"{stripped} {suffix}"
+
+
+def normalize_expression_for_segmentation(expression):
+    if expression is None:
+        return None
+
+    normalized = expression.strip()
+    if re.match(r"^\s*which\b", normalized, flags=re.IGNORECASE):
+        normalized = re.sub(r"^\s*which\b\s*", "", normalized, count=1, flags=re.IGNORECASE)
+    return normalized.strip()
+
+
 def aggregate_video_results(video_results):
     if not video_results:
         return None
@@ -129,13 +148,16 @@ class VideoEvalDataset(Dataset):
 
             if "Expression" in data or "expression" in data:
                 expression = data.get("Expression", data.get("expression"))
+                normalized_expression = normalize_expression_for_segmentation(expression)
                 if os.path.isdir(video_abs_path) and len(os.listdir(video_abs_path)) == 0:
                     print(f"Video path does not exist or is empty: {video_abs_path}")
                     continue
-                instruction = f"Can you segment '{expression.rstrip('.').lower()}' in the video?"
-                phrase = expression.rstrip(".")
+                instruction = ensure_segmentation_mask_request(
+                    f"Can you segment '{normalized_expression.rstrip('.').lower()}' in the video?"
+                )
+                phrase = normalized_expression.rstrip(".")
             else:
-                instruction = data["question"]
+                instruction = ensure_segmentation_mask_request(data["question"])
                 phrase = infer_phrase_from_instruction(instruction)
 
             data_list_new.append(
@@ -245,7 +267,9 @@ def save_results(result, save_path):
     metrics = {"j": j, "f": f, "j&f": (j + f) / 2}
     result.insert(0, metrics)
 
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     if save_path.endswith(".json"):
         with open(save_path, "w") as f:
             json.dump(result, f, indent=4)
@@ -276,7 +300,7 @@ def load_video_inference_stack(args, local_rank):
     device_map = {"": f"cuda:{local_rank}"} if torch.cuda.is_available() else "auto"
     tokenizer, model, processor = load_pretrained_model(
         args.model_path,
-        None,
+        args.model_base,
         device_map=device_map,
         attn_implementation=args.attn_implementation,
     )
@@ -336,6 +360,11 @@ def run_single_inference(sample, processor, tokenizer, model, video_seg_engine, 
     output_text = processor.tokenizer.batch_decode(
         generated_output_ids, skip_special_tokens=False
     )[0].strip()
+    if video_results is None:
+        raise RuntimeError(
+            "Video segmentation failed to produce results for sample "
+            f"{sample['idx']} ({sample['video_path']}). Model output: {output_text}"
+        )
     pred_masks = aggregate_video_results(video_results)
     return output_text, pred_masks, video_results
 
@@ -348,6 +377,7 @@ def run_inference(args):
     val_loader = build_eval_dataloader(args, distributed)
 
     results = []
+    failed_samples = []
     for batch in tqdm(
         val_loader,
         desc=f"Rank {global_rank}",
@@ -355,15 +385,24 @@ def run_inference(args):
         position=local_rank,
     ):
         for sample in batch:
-            output_text, pred_masks, video_results = run_single_inference(
-                sample, processor, tokenizer, model, video_seg_engine, args
-            )
-
             gt_masks = np.asarray(sample["gt_masks"]).astype(bool)
             h, w = gt_masks.shape[1], gt_masks.shape[2]
-            if pred_masks is None:
-                pred_masks = np.zeros((len(gt_masks), h, w), dtype=bool)
-            else:
+            output_text = ""
+            video_results = None
+            error_message = None
+            pred_masks = None
+
+            try:
+                output_text, pred_masks, video_results = run_single_inference(
+                    sample, processor, tokenizer, model, video_seg_engine, args
+                )
+
+                if pred_masks is None:
+                    raise RuntimeError(
+                        "Aggregated video masks are empty for sample "
+                        f"{sample['idx']} ({sample['video_path']})."
+                    )
+
                 pred_masks = [
                     np.zeros((h, w), dtype=bool) if mask is None else mask.astype(bool)
                     for mask in pred_masks
@@ -371,18 +410,39 @@ def run_inference(args):
                 pred_masks = np.asarray(pred_masks)
                 pred_masks = resize_pred_masks_if_needed(pred_masks, h, w)
 
-            mask_rles = [single_mask_to_rle(pred_mask.astype(np.uint8)) for pred_mask in pred_masks]
-
-            if gt_masks.shape[0] == pred_masks.shape[0]:
-                j = db_eval_iou(gt_masks, pred_masks).mean()
-                f = db_eval_boundary(gt_masks, pred_masks).mean()
-            else:
-                print(
-                    f"Data {sample['idx']}: GT frames ({gt_masks.shape[0]}) != Pred frames ({pred_masks.shape[0]}), "
-                    "skip intermediate eval"
+                if gt_masks.shape[0] == pred_masks.shape[0]:
+                    j = db_eval_iou(gt_masks, pred_masks).mean()
+                    f = db_eval_boundary(gt_masks, pred_masks).mean()
+                else:
+                    print(
+                        f"Data {sample['idx']}: GT frames ({gt_masks.shape[0]}) != Pred frames ({pred_masks.shape[0]}), "
+                        "skip intermediate eval"
+                    )
+                    raise RuntimeError(
+                        f"GT/pred frame mismatch: {gt_masks.shape[0]} vs {pred_masks.shape[0]}"
+                    )
+            except Exception as exc:
+                error_message = str(exc)
+                failed_samples.append(
+                    {
+                        "idx": sample["idx"],
+                        "video_path": sample["video_path"],
+                        "instruction": sample["instruction"],
+                        "phrase": sample["phrase"],
+                        "prediction": output_text,
+                        "error": error_message,
+                    }
                 )
+                print(
+                    f"[WARN] Sample {sample['idx']} failed and will be scored as zero: "
+                    f"{sample['video_path']} | {error_message}"
+                )
+                pred_masks = np.zeros_like(gt_masks, dtype=bool)
                 j = 0.0
                 f = 0.0
+            mask_rles = [
+                single_mask_to_rle(pred_mask.astype(np.uint8)) for pred_mask in pred_masks
+            ]
 
             results.append(
                 {
@@ -394,6 +454,7 @@ def run_inference(args):
                     "mask_rle": mask_rles,
                     "video_path": sample["video_path"],
                     "num_segments": 0 if video_results is None else len(video_results),
+                    "error": error_message,
                 }
             )
 
@@ -407,14 +468,23 @@ def run_inference(args):
         if global_rank == 0:
             results = sum(gathered_results, [])
             save_results(results, args.output_file)
+            if failed_samples:
+                error_path = str(Path(args.output_file).with_suffix("")) + "_errors.json"
+                with open(error_path, "w") as f:
+                    json.dump(failed_samples, f, indent=4, ensure_ascii=False)
         dist.destroy_process_group()
     else:
         save_results(results, args.output_file)
+        if failed_samples:
+            error_path = str(Path(args.output_file).with_suffix("")) + "_errors.json"
+            with open(error_path, "w") as f:
+                json.dump(failed_samples, f, indent=4, ensure_ascii=False)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--model_base", type=str, default=None)
     parser.add_argument("--sam3_video_checkpoint", type=str, required=True)
     parser.add_argument("--sam3_bpe_path", type=str, default=None)
     parser.add_argument("--video_folder", type=str, default="/mnt")

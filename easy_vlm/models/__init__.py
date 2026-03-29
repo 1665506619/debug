@@ -2,12 +2,14 @@ from . import qwen3_vl
 
 try:
     from . import video_llama_3
-except ImportError:
+except Exception:
     import warnings
 
     warnings.warn("Fail to import `VideoLlama3` implementation from `transformers`.")
 import torch
 import os
+import json
+import warnings
 from .qwen3vl_seg import Qwen3VLSegForConditionalGeneration
 from transformers import (
     AutoConfig,
@@ -35,6 +37,47 @@ def get_model_name_from_path(model_path):
     else:
         return model_paths[-1]
 
+
+def _load_manual_qwen3vl_tokenizer_and_processor(model_path):
+    from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+
+    tokenizer_config_path = os.path.join(model_path, "tokenizer_config.json")
+    tokenizer_kwargs = {
+        "tokenizer_file": os.path.join(model_path, "tokenizer.json"),
+        "clean_up_tokenization_spaces": False,
+    }
+    if os.path.exists(tokenizer_config_path):
+        with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+            tokenizer_config = json.load(f)
+        if tokenizer_config.get("eos_token") is not None:
+            tokenizer_kwargs["eos_token"] = tokenizer_config["eos_token"]
+        if tokenizer_config.get("pad_token") is not None:
+            tokenizer_kwargs["pad_token"] = tokenizer_config["pad_token"]
+        extra_special_tokens = tokenizer_config.get("extra_special_tokens")
+        if isinstance(extra_special_tokens, list):
+            tokenizer_kwargs["additional_special_tokens"] = extra_special_tokens
+
+    tokenizer = Qwen2TokenizerFast(**tokenizer_kwargs)
+    image_processor = AutoImageProcessor.from_pretrained(model_path)
+    video_processor = AutoVideoProcessor.from_pretrained(model_path)
+
+    chat_template = None
+    for candidate in ["chat_template.jinja", "chat_template.json"]:
+        path = os.path.join(model_path, candidate)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                chat_template = f.read()
+            break
+
+    processor = Qwen3VLProcessor(
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+        video_processor=video_processor,
+        chat_template=chat_template,
+    )
+    return tokenizer, processor
+
 def load_pretrained_model(model_path, model_base, load_8bit=False, load_4bit=False, device_map="auto", **kwargs):
     model_name = get_model_name_from_path(model_path)
     if 'token' in kwargs:
@@ -49,6 +92,11 @@ def load_pretrained_model(model_path, model_base, load_8bit=False, load_4bit=Fal
     kwargs = {"device_map": device_map, **kwargs}
 
     config = AutoConfig.from_pretrained(model_path)
+    if hasattr(config, "text_config"):
+        rope_parameters = getattr(config.text_config, "rope_parameters", None)
+        rope_scaling = getattr(config.text_config, "rope_scaling", None)
+        if rope_scaling is None and rope_parameters is not None:
+            config.text_config.rope_scaling = dict(rope_parameters)
     config._attn_implementation = kwargs.pop('attn_implementation', "flash_attention_2") # default to flash_attention_2
 
     torch_dtype = config.torch_dtype if hasattr(config, "torch_dtype") else kwargs.pop('torch_dtype', torch.float16)
@@ -73,14 +121,31 @@ def load_pretrained_model(model_path, model_base, load_8bit=False, load_4bit=Fal
     is_alignment = getattr(config, "tune_mm_mlp_adapter", False) or getattr(config, "is_alignment", False)
 
     # NOTE: lora/qlora model loading
-    if 'lora' in model_name.lower() or 'qlora' in model_name.lower():
+    processor = None
+
+    is_peft_checkpoint = os.path.exists(os.path.join(model_path, "adapter_config.json"))
+
+    if is_peft_checkpoint or 'lora' in model_name.lower() or 'qlora' in model_name.lower():
     # if True:
         cfg_pretrained = PeftConfig.from_pretrained(model_path, token=token)
         # NOTE: AutoConfig will modify `_name_or_path` property to `model_path` if `model_path` is not None.
         # cfg_pretrained = AutoConfig.from_pretrained(model_path, token=token)
         model_base = model_base if model_base is not None else cfg_pretrained.base_model_name_or_path
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, token=token)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, token=token)
+        except Exception as exc:
+            warnings.warn(
+                f"Fast tokenizer load failed for {model_path}: {exc}. Falling back to use_fast=False."
+            )
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, token=token)
+            except Exception as slow_exc:
+                warnings.warn(
+                    f"Slow tokenizer load failed for {model_path}: {slow_exc}. "
+                    "Falling back to manual Qwen3-VL tokenizer/processor construction."
+                )
+                tokenizer, processor = _load_manual_qwen3vl_tokenizer_and_processor(model_path)
         print('Loading Qwen from base model...')
         print(model_base)
         
@@ -111,11 +176,18 @@ def load_pretrained_model(model_path, model_base, load_8bit=False, load_4bit=Fal
         if any(k.startswith('model.model.') for k in non_lora_trainables):
             non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
     
-        non_lora_frozen = load_file(os.path.join(config.mask_decoder_model, 'model.safetensors'))
-        for k, v in non_lora_frozen.items():
-            k = k.replace('detector_model', 'model.grounding_model.model')
-            if k not in non_lora_trainables:
-                non_lora_trainables[k] = v
+        frozen_path = os.path.join(config.mask_decoder_model, 'model.safetensors')
+        if os.path.exists(frozen_path):
+            non_lora_frozen = load_file(frozen_path)
+            for k, v in non_lora_frozen.items():
+                k = k.replace('detector_model', 'model.grounding_model.model')
+                if k not in non_lora_trainables:
+                    non_lora_trainables[k] = v
+        else:
+            warnings.warn(
+                f"SAM3 frozen weights not found at {frozen_path}; "
+                "continuing without loading grounding-model frozen parameters."
+            )
         model.load_state_dict(non_lora_trainables, strict=False)
 
         from peft import PeftModel
@@ -136,12 +208,33 @@ def load_pretrained_model(model_path, model_base, load_8bit=False, load_4bit=Fal
 
 
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, token=token)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, token=token)
+        except Exception as exc:
+            warnings.warn(
+                f"Fast tokenizer load failed for {model_path}: {exc}. Falling back to use_fast=False."
+            )
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, token=token)
+            except Exception as slow_exc:
+                warnings.warn(
+                    f"Slow tokenizer load failed for {model_path}: {slow_exc}. "
+                    "Falling back to manual Qwen3-VL tokenizer/processor construction."
+                )
+                tokenizer, processor = _load_manual_qwen3vl_tokenizer_and_processor(model_path)
         model = Qwen3VLSegForConditionalGeneration.from_pretrained(model_path, config=config, **kwargs)
 
-    processor = AutoProcessor.from_pretrained(
-        model_path,
-    )
+    if processor is None:
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_path,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"AutoProcessor load failed for {model_path}: {exc}. "
+                "Falling back to manual Qwen3-VL tokenizer/processor construction."
+            )
+            tokenizer, processor = _load_manual_qwen3vl_tokenizer_and_processor(model_path)
     
 
     if save_path:

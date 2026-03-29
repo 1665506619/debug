@@ -16,7 +16,10 @@
 
 from transformers import CLIPTextConfig
 
-from transformers.configuration_utils import PreTrainedConfig
+try:
+    from transformers.configuration_utils import PreTrainedConfig
+except ImportError:
+    from transformers.configuration_utils import PretrainedConfig as PreTrainedConfig
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
 
 
@@ -162,10 +165,14 @@ class Sam3VisionConfig(PreTrainedConfig):
             backbone_feature_sizes = [[288, 288], [144, 144], [72, 72]]
 
         if isinstance(backbone_config, dict):
-            backbone_config["model_type"] = backbone_config.get("model_type", "sam3_vit_model")
-            backbone_config = CONFIG_MAPPING[backbone_config["model_type"]](**backbone_config)
+            backbone_model_type = backbone_config.get("model_type", "sam3_vit_model")
+            if backbone_model_type == "sam3_vit_model":
+                backbone_config = Sam3ViTConfig(**backbone_config)
+            else:
+                backbone_config["model_type"] = backbone_model_type
+                backbone_config = CONFIG_MAPPING[backbone_model_type](**backbone_config)
         elif backbone_config is None:
-            backbone_config = CONFIG_MAPPING["sam3_vit_model"]()
+            backbone_config = Sam3ViTConfig()
 
         self.backbone_config = backbone_config
 

@@ -16,6 +16,23 @@ import logging
 from huggingface_hub import hf_hub_download
 import functools
 
+logger = logging.getLogger(__name__)
+
+
+def _sort_frame_paths_numerically(frame_paths: List[str]) -> List[str]:
+    try:
+        return sorted(
+            frame_paths,
+            key=lambda path: int(os.path.splitext(os.path.basename(path))[0]),
+        )
+    except ValueError:
+        logger.warning(
+            'Frame names are not in "<frame_index>.<img_ext>" format; '
+            "falling back to lexicographic sort."
+        )
+        return sorted(frame_paths)
+
+
 def select_vision_outputs(vout_batch, idx: int):
     vout = copy.copy(vout_batch) 
     vout.last_hidden_state = vout_batch.last_hidden_state[idx:idx+1]
@@ -201,7 +218,12 @@ def read_video_frames(
     **kwargs,
 ):
     if isinstance(video, str):
-        frames = sorted([os.path.join(video, x) for x in os.listdir(video) if x.endswith((".jpg", ".jpeg", ".png"))])
+        frames = [
+            os.path.join(video, x)
+            for x in os.listdir(video)
+            if x.endswith((".jpg", ".jpeg", ".png"))
+        ]
+        frames = _sort_frame_paths_numerically(frames)
     else:
         frames = video
 

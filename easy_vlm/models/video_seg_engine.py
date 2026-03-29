@@ -31,7 +31,7 @@ class VideoSegEngine:
         if inference_state is None:
             raise ValueError(
                 "VideoSegEngine has no initialized video state. Call init_video(...) first."
-            )
+        )
         if not phrase:
             raise ValueError("phrase must be a non-empty string")
         if external_query_embed is None:

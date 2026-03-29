@@ -28,9 +28,7 @@ from torch import Tensor
 
 from transformers import CLIPTextModelWithProjection
 
-from transformers import initialization as init
 from transformers.activations import ACT2FN
-from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
     BaseModelOutput,
@@ -42,6 +40,13 @@ from transformers.pytorch_utils import compile_compatible_method_lru_cache
 from transformers.utils import auto_docstring, logging
 from transformers.utils.generic import TransformersKwargs, check_model_inputs
 from transformers.models.auto import AutoModel
+
+def _check_model_inputs_no_tie(func):
+    try:
+        return check_model_inputs(tie_last_hidden_states=False)(func)
+    except TypeError:
+        return check_model_inputs(func)
+
 try:
     from configuration_sam3 import (
         Sam3Config,
@@ -65,6 +70,25 @@ except:
 
 
 logger = logging.get_logger(__name__)
+
+
+def create_bidirectional_mask(config, input_embeds, attention_mask, encoder_hidden_states=None):
+    del config
+    if attention_mask is None:
+        return None
+
+    batch_size = input_embeds.shape[0]
+    query_length = input_embeds.shape[1]
+    key_length = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else attention_mask.shape[1]
+
+    key_mask = attention_mask[:, None, None, :key_length].to(device=input_embeds.device)
+    if key_mask.dtype == torch.bool:
+        key_mask = key_mask.to(dtype=input_embeds.dtype)
+    else:
+        key_mask = (key_mask > 0).to(dtype=input_embeds.dtype)
+
+    additive_mask = (1.0 - key_mask) * torch.finfo(input_embeds.dtype).min
+    return additive_mask.expand(batch_size, 1, query_length, key_length)
 
 
 @dataclass
@@ -786,7 +810,7 @@ class Sam3PreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         super()._init_weights(module)
         if isinstance(module, Sam3ViTEmbeddings):
-            init.normal_(module.position_embeddings, mean=0.0, std=self.config.initializer_range)
+            nn.init.normal_(module.position_embeddings, mean=0.0, std=self.config.initializer_range)
 
 
 @auto_docstring
@@ -807,7 +831,7 @@ class Sam3ViTModel(Sam3PreTrainedModel):
     def get_input_embeddings(self) -> Sam3ViTPatchEmbeddings:
         return self.embeddings.patch_embeddings
 
-    @check_model_inputs(tie_last_hidden_states=False)
+    @_check_model_inputs_no_tie
     @auto_docstring
     def forward(
         self,
@@ -1021,7 +1045,10 @@ class Sam3VisionModel(Sam3PreTrainedModel):
     def __init__(self, config: Sam3VisionConfig):
         super().__init__(config)
         self.config = config
-        self.backbone = AutoModel.from_config(config.backbone_config)
+        if isinstance(config.backbone_config, Sam3ViTConfig):
+            self.backbone = Sam3ViTModel(config.backbone_config)
+        else:
+            self.backbone = AutoModel.from_config(config.backbone_config)
         self.neck = Sam3VisionNeck(config)
 
         self.post_init()
