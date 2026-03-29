@@ -1,0 +1,5 @@
+refcoco.json 10
+refcoco+.json 10
+refcocog.json 10
+grefcoco_single.json 10
+coco_instances.json 3

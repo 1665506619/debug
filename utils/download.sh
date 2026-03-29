@@ -1,0 +1,12 @@
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/egobjectsv1_train.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/lvis_v1_train.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/mapillary.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/paco_lvis.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/partimagenet.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/pascal_part.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/reason_seg_cat.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/refclef.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/roboafford_paco.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/roborefit.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/vg_train_bbox_grounding.json
+wget https://www.modelscope.cn/datasets/CircleRadon/seg-train/resolve/master/paco_ego4d_v1_train.json

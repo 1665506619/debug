@@ -1,0 +1,16 @@
+triggers:
+  push:
+    branches:  
+      - main
+  merge_request:
+    target-branches: 
+      - main
+
+jobs:
+  check_code_quality:
+    steps:
+      - uses: checkout
+      - run: |
+          pip install ruff
+          ruff check easy_vlm tests tools experiment
+          ruff format easy_vlm tests tools experiment --check

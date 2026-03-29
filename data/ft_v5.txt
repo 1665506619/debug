@@ -1,0 +1,14 @@
+reason_seg_cat.json 10
+roboafford_paco.json 1
+refcoco.json 2
+refcoco+.json 2
+refcocog.json 2
+grefcoco_single.json 2
+refclef.json 2
+roborefit.json 2
+lisa_plus_cot.json 2
+lisa_plus_instance.json 2
+humanref_45k_mask.json 1
+SA-1B_10k_qa.json 1
+epic_kitchen_qa_no_none.json 1
+hd_epic_qa_no_none.json 1
