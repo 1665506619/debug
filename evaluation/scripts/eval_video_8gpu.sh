@@ -18,6 +18,9 @@ shift 6
 
 NUM_CHUNKS=${NUM_CHUNKS:-8}
 GPU_IDS_STR=${GPU_IDS:-"0,1,2,3,4,5,6,7"}
+DEFAULT_NUM_WORKERS=${NUM_WORKERS:-4}
+DEFAULT_VIDEO_LOADER_TYPE=${VIDEO_LOADER_TYPE:-torchcodec}
+DEFAULT_ASYNC_LOADING_FRAMES=${ASYNC_LOADING_FRAMES:-true}
 IFS=',' read -r -a GPU_IDS_ARR <<< "$GPU_IDS_STR"
 
 if [ "${#GPU_IDS_ARR[@]}" -lt "$NUM_CHUNKS" ]; then
@@ -48,10 +51,16 @@ for ((CHUNK_IDX=0; CHUNK_IDX<NUM_CHUNKS; CHUNK_IDX++)); do
         --output_file "${CHUNK_OUTPUT}"
         --num-chunks "${NUM_CHUNKS}"
         --chunk-idx "${CHUNK_IDX}"
+        --num-workers "${DEFAULT_NUM_WORKERS}"
+        --video-loader-type "${DEFAULT_VIDEO_LOADER_TYPE}"
     )
 
     if [[ "${MODEL_BASE}" != "-" && "${MODEL_BASE}" != "None" && "${MODEL_BASE}" != "none" ]]; then
         CMD+=(--model_base "${MODEL_BASE}")
+    fi
+
+    if [[ "${DEFAULT_ASYNC_LOADING_FRAMES}" == "true" ]]; then
+        CMD+=(--async-loading-frames)
     fi
 
     echo "Launching chunk ${CHUNK_IDX}/${NUM_CHUNKS} on GPU ${GPU_ID} -> ${CHUNK_OUTPUT}"
