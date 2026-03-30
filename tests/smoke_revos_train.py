@@ -86,6 +86,47 @@ def _move_to_device(value: Any, device: torch.device):
     return value
 
 
+def _classify_runtime_failure(exc: Exception) -> str:
+    if isinstance(exc, (ImportError, ModuleNotFoundError, FileNotFoundError, PermissionError, OSError)):
+        return "env_missing"
+
+    message = str(exc)
+    env_markers = (
+        "No module named",
+        "No such file or directory",
+        "CUDA is not available",
+        "Found no NVIDIA driver",
+        "not compiled with CUDA",
+        "libcuda",
+        "NCCL",
+        "cudnn",
+        "triton",
+        "weights/pretrain_weights",
+    )
+    if any(marker in message for marker in env_markers):
+        return "env_missing"
+    return "code_error"
+
+
+def _inspect_named_video_query_params(named_params: Dict[str, nn.Parameter]) -> Dict[str, Any]:
+    projector_names = [
+        name
+        for name, param in named_params.items()
+        if "video_query_projector" in name and param.requires_grad
+    ]
+    alpha_names = [
+        name
+        for name, param in named_params.items()
+        if "video_query_alpha" in name and param.requires_grad
+    ]
+    return {
+        "projector_param_names": projector_names,
+        "projector_found": len(projector_names) > 0,
+        "alpha_param_names": alpha_names,
+        "alpha_found": len(alpha_names) > 0,
+    }
+
+
 class _TinyOptimizerCheckModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -93,6 +134,7 @@ class _TinyOptimizerCheckModel(nn.Module):
         self.text_hidden_fcs = nn.ModuleList([nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))])
         self.mask_hidden_fcs = nn.ModuleList([nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))])
         self.video_query_projector = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))
+        self.video_query_alpha = nn.Parameter(torch.zeros(1))
         self.mask_queries = nn.Parameter(torch.zeros(4, 8))
 
     def forward(self, **kwargs):
@@ -154,16 +196,16 @@ def _make_training_args(
 
 def _inspect_optimizer_groups(model: nn.Module, optimizer) -> Dict[str, Any]:
     named_params = dict(model.named_parameters())
-    projector_names = [
-        name
-        for name, param in named_params.items()
-        if "video_query_projector" in name and param.requires_grad
-    ]
+    target_params = _inspect_named_video_query_params(named_params)
+    projector_names = target_params["projector_param_names"]
+    alpha_names = target_params["alpha_param_names"]
     param_id_to_name = {id(param): name for name, param in named_params.items()}
 
     group_summaries = []
     projector_group_names = []
+    alpha_group_names = []
     projector_params_in_optimizer = set()
+    alpha_params_in_optimizer = set()
     for group_idx, group in enumerate(optimizer.param_groups):
         group_name = group.get("name", f"group_{group_idx}")
         group_param_names = []
@@ -175,6 +217,9 @@ def _inspect_optimizer_groups(model: nn.Module, optimizer) -> Dict[str, Any]:
             if "video_query_projector" in param_name:
                 projector_params_in_optimizer.add(param_name)
                 projector_group_names.append(group_name)
+            if "video_query_alpha" in param_name:
+                alpha_params_in_optimizer.add(param_name)
+                alpha_group_names.append(group_name)
 
         group_summaries.append(
             {
@@ -184,17 +229,22 @@ def _inspect_optimizer_groups(model: nn.Module, optimizer) -> Dict[str, Any]:
                 "video_query_projector_param_count": sum(
                     1 for name in group_param_names if "video_query_projector" in name
                 ),
+                "video_query_alpha_param_count": sum(
+                    1 for name in group_param_names if "video_query_alpha" in name
+                ),
             }
         )
 
-    projector_found = len(projector_names) > 0
     projector_all_in_optimizer = sorted(projector_params_in_optimizer) == sorted(projector_names)
+    alpha_all_in_optimizer = sorted(alpha_params_in_optimizer) == sorted(alpha_names)
     return {
-        "projector_param_names": projector_names,
-        "projector_found": projector_found,
+        **target_params,
         "projector_params_in_optimizer": sorted(projector_params_in_optimizer),
         "projector_all_in_optimizer": projector_all_in_optimizer,
         "projector_group_names": sorted(set(projector_group_names)),
+        "alpha_params_in_optimizer": sorted(alpha_params_in_optimizer),
+        "alpha_all_in_optimizer": alpha_all_in_optimizer,
+        "alpha_group_names": sorted(set(alpha_group_names)),
         "group_summaries": group_summaries,
     }
 
@@ -205,12 +255,18 @@ def _print_optimizer_report(report: Dict[str, Any]) -> None:
     print(f"video_query_projector params in optimizer: {report['projector_params_in_optimizer']}")
     print(f"video_query_projector all in optimizer groups: {report['projector_all_in_optimizer']}")
     print(f"video_query_projector group names: {report['projector_group_names']}")
+    print(f"video_query_alpha params found: {report['alpha_found']}")
+    print(f"video_query_alpha param names: {report['alpha_param_names']}")
+    print(f"video_query_alpha params in optimizer: {report['alpha_params_in_optimizer']}")
+    print(f"video_query_alpha all in optimizer groups: {report['alpha_all_in_optimizer']}")
+    print(f"video_query_alpha group names: {report['alpha_group_names']}")
     print(f"optimizer group count: {len(report['group_summaries'])}")
     for group in report["group_summaries"]:
         print(
             f"  group[{group['index']}]: name={group['name']} "
             f"param_count={group['param_count']} "
-            f"video_query_projector_param_count={group['video_query_projector_param_count']}"
+            f"video_query_projector_param_count={group['video_query_projector_param_count']} "
+            f"video_query_alpha_param_count={group['video_query_alpha_param_count']}"
         )
 
 
@@ -236,18 +292,20 @@ def _run_real_train_step(
     args: argparse.Namespace,
     tmp_path: Path,
     train_json: Path,
-) -> Tuple[bool, Optional[float], Optional[str]]:
+) -> Tuple[str, Optional[float], Optional[str]]:
     try:
         print("[smoke] importing dataset runtime...")
         dataset_runtime = _try_load_dataset_runtime()
     except Exception as exc:
-        return False, None, f"dataset runtime import failed: {exc}"
+        failure_kind = _classify_runtime_failure(exc)
+        return failure_kind, None, f"dataset runtime import failed: {exc}"
 
     try:
         print("[smoke] importing build_model...")
         build_model = _try_load_build_model()
     except Exception as exc:
-        return False, None, f"build_model import failed: {exc}"
+        failure_kind = _classify_runtime_failure(exc)
+        return failure_kind, None, f"build_model import failed: {exc}"
 
     try:
         print("[smoke] building real model...")
@@ -255,9 +313,19 @@ def _run_real_train_step(
         model, processor, seg_processor = build_model(training_args)
         print("[smoke] real model built.")
     except Exception as exc:
-        return False, None, f"real model build failed: {exc}"
+        failure_kind = _classify_runtime_failure(exc)
+        return failure_kind, None, f"real model build failed: {exc}"
 
     try:
+        named_params = dict(model.named_parameters())
+        real_param_report = _inspect_named_video_query_params(named_params)
+        print(f"[smoke] real model trainable video_query_projector params: {real_param_report['projector_param_names']}")
+        print(f"[smoke] real model trainable video_query_alpha params: {real_param_report['alpha_param_names']}")
+        if not real_param_report["projector_found"]:
+            return "code_error", None, "real model build left video_query_projector frozen or missing"
+        if not real_param_report["alpha_found"]:
+            return "code_error", None, "real model build left video_query_alpha frozen or missing"
+
         print("[smoke] constructing dataset...")
         dataset = dataset_runtime.SFTDataset(
             model_config=model.config,
@@ -273,7 +341,7 @@ def _run_real_train_step(
             use_multi_objs=False,
         )
         if len(dataset) == 0:
-            return False, None, "constructed dataset is empty"
+            return "code_error", None, "constructed dataset is empty"
 
         print("[smoke] materializing dataset instances...")
         instances = [dataset[idx] for idx in range(min(len(dataset), args.max_samples))]
@@ -290,7 +358,7 @@ def _run_real_train_step(
         trainer.create_optimizer()
         optimizer = trainer.optimizer
         if optimizer is None:
-            return False, None, "trainer.create_optimizer() returned None for real model"
+            return "code_error", None, "trainer.create_optimizer() returned None for real model"
 
         device = torch.device(args.device)
         print(f"[smoke] moving model to {device}...")
@@ -304,15 +372,16 @@ def _run_real_train_step(
         outputs = model(**batch)
         loss = outputs.loss
         if loss is None or not torch.isfinite(loss):
-            return False, None, f"loss is invalid: {loss}"
+            return "code_error", None, f"loss is invalid: {loss}"
         print(f"[smoke] forward ok, loss={loss.item():.6f}")
         print("[smoke] running backward...")
         loss.backward()
         print("[smoke] optimizer.step()...")
         optimizer.step()
-        return True, float(loss.item()), None
+        return "passed", float(loss.item()), None
     except Exception as exc:
-        return False, None, f"real train step failed: {exc}\n{traceback.format_exc()}"
+        failure_kind = _classify_runtime_failure(exc)
+        return failure_kind, None, f"real train step failed: {exc}\n{traceback.format_exc()}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -377,8 +446,12 @@ def main() -> None:
         _print_optimizer_report(optimizer_report)
         if not optimizer_report["projector_found"]:
             raise RuntimeError("video_query_projector parameters were not found in the smoke-check model")
+        if not optimizer_report["alpha_found"]:
+            raise RuntimeError("video_query_alpha parameter was not found in the smoke-check model")
         if not optimizer_report["projector_all_in_optimizer"]:
             raise RuntimeError("Not all video_query_projector parameters were placed into optimizer groups")
+        if not optimizer_report["alpha_all_in_optimizer"]:
+            raise RuntimeError("video_query_alpha was not placed into optimizer groups")
 
         expected_group_names = {"sam_decoder", "sam_decoder_nodecay"}
         if not set(optimizer_report["projector_group_names"]).issubset(expected_group_names):
@@ -386,18 +459,32 @@ def main() -> None:
                 "video_query_projector parameters landed in unexpected optimizer groups: "
                 f"{optimizer_report['projector_group_names']}"
             )
+        if not set(optimizer_report["alpha_group_names"]).issubset(expected_group_names):
+            raise RuntimeError(
+                "video_query_alpha landed in unexpected optimizer groups: "
+                f"{optimizer_report['alpha_group_names']}"
+            )
+        if not set(optimizer_report["alpha_group_names"]).intersection(optimizer_report["projector_group_names"]):
+            raise RuntimeError(
+                "video_query_alpha did not share a training optimizer path with video_query_projector: "
+                f"alpha_groups={optimizer_report['alpha_group_names']} "
+                f"projector_groups={optimizer_report['projector_group_names']}"
+            )
 
-        ran_real_step, loss_value, real_step_error = _run_real_train_step(
+        real_step_status, loss_value, real_step_error = _run_real_train_step(
             runtime=runtime,
             args=args,
             tmp_path=tmp_path,
             train_json=output_json,
         )
-        print(f"real forward/backward/step executed: {ran_real_step}")
-        if ran_real_step:
+        print(f"real forward/backward/step status: {real_step_status}")
+        if real_step_status == "passed":
             print(f"real train-step loss: {loss_value:.6f}")
+        elif real_step_status == "env_missing":
+            print(f"real train-step skipped_environment: {real_step_error}")
         else:
-            print(f"real train-step skipped_or_failed: {real_step_error}")
+            print(f"real train-step code_error: {real_step_error}")
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

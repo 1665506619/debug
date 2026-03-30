@@ -312,6 +312,8 @@ class Qwen3VLSegModel(_Qwen3VLModel):
         return Qwen3VLSegModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
             labels=labels,
         )
@@ -343,6 +345,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             ce_loss_weight=config.bce_loss_weight,
             cls_loss_weight=config.cls_loss_weight,
         )
+        self._reset_generation_state()
 
     def get_model(self):
         return self.model
@@ -350,7 +353,28 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
     def set_video_seg_engine(self, video_seg_engine):
         self.video_seg_engine = video_seg_engine
 
+    def _ensure_generation_state(self):
+        if not hasattr(self, "SEG_START"):
+            self.SEG_START = None
+        if not hasattr(self, "seg_output_embeddings") or self.seg_output_embeddings is None:
+            self.seg_output_embeddings = []
+        if not hasattr(self, "disable_seg_query_generation"):
+            self.disable_seg_query_generation = False
+
+    def _reset_generation_state(self):
+        self._ensure_generation_state()
+        self.SEG_START = None
+        self.seg_output_embeddings = []
+        self.model.rope_deltas = None
+
+    def generate(self, *args, **kwargs):
+        self._reset_generation_state()
+        if not kwargs.get("disable_seg_query_generation", False):
+            kwargs.setdefault("output_hidden_states", True)
+        return super().generate(*args, **kwargs)
+
     def _build_video_external_query_embed(self):
+        self._ensure_generation_state()
         if len(self.seg_output_embeddings) == 0:
             return None
         seg_output_embeddings = torch.cat(self.seg_output_embeddings, dim=0)
@@ -470,8 +494,11 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
         if labels is not None: # training
             ce_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+            loss = ce_loss
             
-            mask_valid_ = False
+            # Fallback to CE only when the whole batch has no effective mask
+            # supervision at all; one invalid sample must not wipe valid ones.
+            batch_has_valid_mask_supervision = False
             if masks[0] is not None:
                 g_pixel_values = torch.stack(sam_images, dim=0)  # [bs, C, H, W]
                 with torch.no_grad():
@@ -506,7 +533,9 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     phrase_embedding = self.model.text_hidden_fcs[0](phrase_embedding.unsqueeze(0)).squeeze(0)
                 
                     gt_mask = masks[i]
-                    mask_valid_ = masks_valid[i]
+                    sample_mask_valid = True if masks_valid is None else bool(masks_valid[i])
+                    if not sample_mask_valid:
+                        continue
 
                     g_pixel_values = sam_images[i].unsqueeze(0)
 
@@ -528,10 +557,9 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     )
 
                     if phrase_embedding.shape[0] == 0:
-                        mask_valid_ = False
                         print(data_indices)
                         print('phrase_embedding is empty')
-                        break
+                        continue
                     else:
                         for start in range(0, obj_num, max_chunk):
                             end = min(start + max_chunk, obj_num)
@@ -564,6 +592,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                                 gt_masks_cur = gt_mask_rs[mask_id_tensor]                   # [Ng, 1, H, W]
 
                                 if gt_mask_rs.sum()>0: # not null
+                                    batch_has_valid_mask_supervision = True
 
                                     assign_id = self.assigner.assign(
                                         pred_masks_cur.float(),
@@ -635,7 +664,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 mask_loss = mask_bce_loss + mask_dice_loss
                 loss = mask_loss + ce_loss + cls_loss
     
-            if not mask_valid_:
+            if not batch_has_valid_mask_supervision:
                 # print('No valid masks found.')
                 loss = ce_loss
                 mask_bce_loss = loss * 0.0
@@ -678,10 +707,10 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         phrase_ids = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
-        self.SEG_START = None
-        self.seg_output_embeddings = []
         kwargs.pop("mm_token_type_ids", None)
         kwargs.setdefault("use_cache", False)
+        kwargs.setdefault("return_dict_in_generate", True)
+        kwargs.setdefault("output_hidden_states", True)
         outputs = self.generate(
             **kwargs
         )
@@ -696,6 +725,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
         pred_masks = None
         pred_logits = None
+        seg_output_embeddings = None
         try:
             if len(self.seg_output_embeddings)>0:
                 seg_output_embeddings = torch.cat(self.seg_output_embeddings, dim=0)
@@ -724,7 +754,8 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
         except Exception as exp:
             print('Segmentation inference error:', exp)
-            print(seg_output_embeddings.shape)
+            if seg_output_embeddings is not None:
+                print(seg_output_embeddings.shape)
             print(output_ids)
             pred_masks = None
             pred_logits = None
@@ -745,10 +776,10 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         propagate_both_directions=False,
         **kwargs: Unpack[TransformersKwargs],
     ):
-        self.SEG_START = None
-        self.seg_output_embeddings = []
         kwargs.pop("mm_token_type_ids", None)
         kwargs.setdefault("use_cache", False)
+        kwargs.setdefault("return_dict_in_generate", True)
+        kwargs.setdefault("output_hidden_states", True)
         outputs = self.generate(**kwargs)
         input_ids = kwargs["input_ids"]
         output_ids = outputs.sequences
@@ -822,6 +853,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         video_grid_thw: torch.LongTensor | None = None,
         **kwargs,
     ):
+        self._ensure_generation_state()
         model_inputs = _Qwen3VLForConditionalGeneration.prepare_inputs_for_generation(
             self,
             input_ids,
@@ -922,9 +954,18 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         is_encoder_decoder: bool = False,
         num_new_tokens: int = 1,
     ) -> dict[str, Any]:
+        self._ensure_generation_state()
         seg_start = self.SEG_START
         if seg_start is not None:
-            self.seg_output_embeddings.append(outputs['hidden_states'][-1][:, 2:-1])
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is None and isinstance(outputs, dict):
+                hidden_states = outputs.get("hidden_states")
+            if hidden_states is None:
+                raise RuntimeError(
+                    "Seg-query generation requires hidden states. "
+                    "Call generate(..., output_hidden_states=True) or use inference()/inference_video()."
+                )
+            self.seg_output_embeddings.append(hidden_states[-1][:, 2:-1])
 
         model_kwargs = super()._update_model_kwargs_for_generation(
             outputs=outputs,

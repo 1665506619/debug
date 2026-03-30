@@ -218,7 +218,7 @@ class Trainer(TransformersTrainer):
                     vision_encoder_parameters.append((n, p))
                 elif "grounding_model.model.vision_encoder" in n or "grounding_model.model.backbone.vision_backbone" in n:
                     mask_encoder_parameters.append((n, p))
-                elif "grounding_model" in n or "text_hidden_fcs" in n or "mask_hidden_fcs" in n or "video_query_projector" in n or "mask_queries" in n:
+                elif "grounding_model" in n or "text_hidden_fcs" in n or "mask_hidden_fcs" in n or "video_query_projector" in n or "video_query_alpha" in n or "mask_queries" in n:
                     mask_decoder_parameters.append((n, p))
                 else:
                     llm_parameters.append((n, p))

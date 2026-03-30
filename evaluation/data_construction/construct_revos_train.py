@@ -48,7 +48,7 @@ def _build_expression_sample(
         "height": video_meta["height"],
         "width": video_meta["width"],
         "type_id": exp_meta.get("type_id"),
-        "revos_video_meta_file": video_meta_output_path.name,
+        "revos_video_meta_file": str(video_meta_output_path),
         "revos_mask_dict_path": str(mask_dict_path),
     }
 
