@@ -30,6 +30,20 @@ def _update_out(out, out_name, out_value, auxiliary=True, update_aux=True):
             aux_output[out_name] = aux_value
 
 
+def _cast_float_tensor_tree(value, dtype):
+    if torch.is_tensor(value):
+        if torch.is_floating_point(value):
+            return value.to(dtype=dtype)
+        return value
+    if isinstance(value, tuple):
+        return tuple(_cast_float_tensor_tree(item, dtype) for item in value)
+    if isinstance(value, list):
+        return [_cast_float_tensor_tree(item, dtype) for item in value]
+    if isinstance(value, dict):
+        return {key: _cast_float_tensor_tree(item, dtype) for key, item in value.items()}
+    return value
+
+
 class Sam3Image(torch.nn.Module):
     TEXT_ID_FOR_TEXT = 0
     TEXT_ID_FOR_VISUAL = 1
@@ -218,6 +232,10 @@ class Sam3Image(torch.nn.Module):
     ):
         feat_tuple = self._get_img_feats(backbone_out, find_input.img_ids)
         backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = feat_tuple
+        target_dtype = next(self.transformer.parameters()).dtype
+        img_feats = _cast_float_tensor_tree(img_feats, target_dtype)
+        img_pos_embeds = _cast_float_tensor_tree(img_pos_embeds, target_dtype)
+        prompt = _cast_float_tensor_tree(prompt, target_dtype)
 
         # Run the encoder
         prompt_pos_embed = torch.zeros_like(prompt)
@@ -259,35 +277,50 @@ class Sam3Image(torch.nn.Module):
         encoder_out,
         external_query_embed=None,
     ):
+        target_dtype = next(self.transformer.parameters()).dtype
+        memory = _cast_float_tensor_tree(memory, target_dtype)
+        pos_embed = _cast_float_tensor_tree(pos_embed, target_dtype)
+        prompt = _cast_float_tensor_tree(prompt, target_dtype)
         bs = memory.shape[1]
-        if external_query_embed is None:
-            query_embed = self.transformer.decoder.query_embed.weight
-            tgt = query_embed.unsqueeze(1).repeat(1, bs, 1)
-        else:
-            query_embed = external_query_embed.to(device=memory.device, dtype=memory.dtype)
-            if query_embed.dim() == 2:
-                tgt = query_embed.unsqueeze(1).repeat(1, bs, 1)
-            elif query_embed.dim() == 3:
-                if query_embed.shape[1] != bs:
+        query_embed = self.transformer.decoder.query_embed.weight.to(device=memory.device, dtype=memory.dtype)
+        tgt = query_embed.unsqueeze(1).repeat(1, bs, 1)
+        reference_boxes = None
+        if external_query_embed is not None:
+            external_query_embed = external_query_embed.to(device=memory.device, dtype=memory.dtype)
+            if external_query_embed.dim() == 2:
+                external_query_embed = external_query_embed.unsqueeze(1).repeat(1, bs, 1)
+            elif external_query_embed.dim() == 3:
+                if external_query_embed.shape[1] != bs:
                     raise ValueError(
                         "external_query_embed batch size mismatch: "
-                        f"expected {bs}, got {query_embed.shape[1]}"
+                        f"expected {bs}, got {external_query_embed.shape[1]}"
                     )
-                tgt = query_embed
             else:
                 raise ValueError(
                     "external_query_embed must be 2D or 3D, got "
-                    f"{query_embed.dim()}D tensor"
+                    f"{external_query_embed.dim()}D tensor"
                 )
+            query_count = external_query_embed.shape[0]
+            if query_count <= 0:
+                raise ValueError("external_query_embed must provide at least one query slot")
+            if query_count > self.transformer.decoder.reference_points.num_embeddings:
+                raise ValueError(
+                    "external_query_embed provides more queries than sam3_full reference points: "
+                    f"{query_count} > {self.transformer.decoder.reference_points.num_embeddings}"
+                )
+            tgt = external_query_embed
+            reference_boxes = self.transformer.decoder.reference_points.weight[:query_count]
+            reference_boxes = reference_boxes.to(device=memory.device, dtype=memory.dtype)
+            reference_boxes = reference_boxes.unsqueeze(1).repeat(1, bs, 1).sigmoid()
 
-        apply_dac = self.transformer.decoder.dac and self.training
+        apply_dac = self.transformer.decoder.dac and self.training and external_query_embed is None
         hs, reference_boxes, dec_presence_out, dec_presence_feats = (
             self.transformer.decoder(
                 tgt=tgt,
                 memory=memory,
                 memory_key_padding_mask=src_mask,
                 pos=pos_embed,
-                reference_boxes=None,
+                reference_boxes=reference_boxes,
                 level_start_index=encoder_out["level_start_index"],
                 spatial_shapes=encoder_out["spatial_shapes"],
                 valid_ratios=encoder_out["valid_ratios"],

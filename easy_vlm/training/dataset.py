@@ -28,6 +28,10 @@ data_replace_dict = {
     "SA-1B/": "/lustre/fs12/portfolios/nvr/projects/nvr_lpr_nvgptvision/users/shihaow/region/data/SA-1B/"
 }
 
+_REVOS_VIDEO_META_CACHE: Dict[str, Dict[str, Any]] = {}
+_REVOS_MASK_DICT_CACHE: Dict[str, Dict[str, Any]] = {}
+_REVOS_OBJECT_MASK_CACHE: Dict[tuple[str, int, str], Dict[str, Any]] = {}
+
 def _get_rope_index_qwen3_vl(
     model_config: PretrainedConfig,
     input_ids: torch.LongTensor,
@@ -241,6 +245,7 @@ class DataCollator(object):
         batch["masks_valid"] = [x["mask_valid"] for x in instances]
         batch["mask_type"] = [x["mask_type"] for x in instances]
         batch["mask_ids"] = [x["mask_ids"] for x in instances]
+        batch["modalities"] = [x["sample_modality"] for x in instances]
 
         return batch
 
@@ -313,6 +318,7 @@ class DataCollator(object):
         batch["masks_valid"] = [x["mask_valid"] for x in instances]
         batch["mask_type"] = [x["mask_type"] for x in instances]
         batch["mask_ids"] = [x["mask_ids"] for x in instances]
+        batch["modalities"] = [x["sample_modality"] for x in instances]
 
         return batch
 
@@ -438,6 +444,8 @@ class SFTDataset(Dataset):
                 for ann in data_dict["annotation"]:
                     if "ann" in ann and ann["ann"] is not None:
                         mask_num += 1
+            elif data_dict.get("source") == "revos_train" and data_dict.get("anno_ids") is not None:
+                mask_num += len(data_dict["anno_ids"])
             elif "mask" in data_dict and data_dict["mask"] is not None:
                 mask_num += len(data_dict['mask'])
             if mask_num == 0:
@@ -470,7 +478,10 @@ class SFTDataset(Dataset):
         list_data_dict = []
         for d in data_path:
             rank0_print(f'begin load {d}...')
-            dataset = load_dataset('json', data_files=os.path.join(data_args.data_path_root,d), cache_dir=cache_dir)['train']
+            source_json_path = os.path.join(data_args.data_path_root, d)
+            dataset = load_dataset('json', data_files=source_json_path, cache_dir=cache_dir)['train']
+            if "__source_json_path" not in dataset.column_names:
+                dataset = dataset.add_column("__source_json_path", [source_json_path] * len(dataset))
             list_data_dict.append(dataset)
             # data_dict_inner = []
             # if d.endswith(".json"):
@@ -488,6 +499,113 @@ class SFTDataset(Dataset):
             #     data_dict_inner = preprocess_data_list(data_dict_inner, d, self.max_seg_nums)
             # list_data_dict.extend(data_dict_inner)
         return concatenate_datasets(list_data_dict)
+
+    def _is_compact_revos_train_sample(self, data_dict):
+        return (
+            data_dict.get("source") == "revos_train"
+            and data_dict.get("source_dataset") == "revos"
+            and data_dict.get("video") is None
+            and data_dict.get("annotation") is None
+            and data_dict.get("video_id") is not None
+            and data_dict.get("anno_ids") is not None
+            and data_dict.get("expression") is not None
+        )
+
+    def _resolve_revos_aux_path(self, data_dict, field_name, default_filename=None):
+        path_value = data_dict.get(field_name)
+        if path_value is None:
+            if default_filename is None:
+                return None
+            path_value = default_filename
+
+        if os.path.isabs(path_value):
+            return path_value
+
+        source_json_path = data_dict.get("__source_json_path")
+        if source_json_path is not None:
+            return os.path.join(os.path.dirname(source_json_path), path_value)
+        return self._resolve_local_path(path_value)
+
+    def _load_revos_video_meta(self, path):
+        resolved_path = os.path.abspath(path)
+        if resolved_path not in _REVOS_VIDEO_META_CACHE:
+            with open(resolved_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict) and "videos" in payload:
+                payload = payload["videos"]
+            _REVOS_VIDEO_META_CACHE[resolved_path] = payload
+        return _REVOS_VIDEO_META_CACHE[resolved_path]
+
+    def _load_revos_mask_dict(self, path):
+        resolved_path = os.path.abspath(path)
+        if resolved_path not in _REVOS_MASK_DICT_CACHE:
+            with open(resolved_path, "r", encoding="utf-8") as f:
+                _REVOS_MASK_DICT_CACHE[resolved_path] = json.load(f)
+        return _REVOS_MASK_DICT_CACHE[resolved_path]
+
+    def _build_revos_object_mask_dict(self, mask_dict_path, anno_id, frame_names, mask_dict):
+        frame_key = "\t".join(frame_names)
+        cache_key = (os.path.abspath(mask_dict_path), int(anno_id), frame_key)
+        if cache_key not in _REVOS_OBJECT_MASK_CACHE:
+            object_masks = mask_dict[str(anno_id)]
+            if len(object_masks) != len(frame_names):
+                raise ValueError(
+                    f"REVoS anno_id={anno_id} has {len(object_masks)} masks but video has {len(frame_names)} frames"
+                )
+            _REVOS_OBJECT_MASK_CACHE[cache_key] = {
+                frame_name: mask_ann
+                for frame_name, mask_ann in zip(frame_names, object_masks)
+            }
+        return _REVOS_OBJECT_MASK_CACHE[cache_key]
+
+    def _resolve_compact_revos_train_sample(self, data_dict):
+        video_meta_path = self._resolve_revos_aux_path(
+            data_dict,
+            "revos_video_meta_file",
+            default_filename="revos_train_sft_videos.json",
+        )
+        if video_meta_path is None:
+            raise ValueError("Compact REVoS sample is missing video metadata sidecar path")
+        video_meta_dict = self._load_revos_video_meta(video_meta_path)
+
+        video_id = data_dict["video_id"]
+        if video_id not in video_meta_dict:
+            raise KeyError(f"video_id={video_id} is missing from {video_meta_path}")
+        video_meta = video_meta_dict[video_id]
+        frame_names = list(video_meta["frame_names"])
+
+        mask_dict_path = self._resolve_revos_aux_path(
+            data_dict,
+            "revos_mask_dict_path",
+        )
+        if mask_dict_path is None:
+            mask_dict_path = os.path.join(self.data_root, "mask_dict.json")
+        mask_dict = self._load_revos_mask_dict(mask_dict_path)
+
+        annotation_ann = [
+            self._build_revos_object_mask_dict(
+                mask_dict_path=mask_dict_path,
+                anno_id=anno_id,
+                frame_names=frame_names,
+                mask_dict=mask_dict,
+            )
+            for anno_id in data_dict["anno_ids"]
+        ]
+
+        resolved = dict(data_dict)
+        resolved["video"] = [f"{video_meta['video_rel_path']}/{frame_name}.jpg" for frame_name in frame_names]
+        resolved["frame_names"] = frame_names
+        resolved["annotation"] = [
+            {
+                "type": "phrase",
+                "text": data_dict["expression"],
+                "ann_type": "mask",
+                "ann": annotation_ann,
+            }
+        ]
+        resolved["height"] = data_dict.get("height", video_meta.get("height"))
+        resolved["width"] = data_dict.get("width", video_meta.get("width"))
+        return resolved
 
     def _resolve_local_path(self, path, apply_replace=False):
         if path is None:
@@ -1114,6 +1232,9 @@ class SFTDataset(Dataset):
 
 
     def _preprocess(self, data_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        if self._is_compact_revos_train_sample(data_dict):
+            data_dict = self._resolve_compact_revos_train_sample(data_dict)
+
         if data_dict["type"]=="instseg":
             if random.random()>0.5:
                 conversation, sam_images, sam_size, masks, mask_ids, mask_valid, mask_type, phrase_str = self._convert_conversation_instseg(data_dict)
@@ -1141,6 +1262,12 @@ class SFTDataset(Dataset):
         model_inputs["mask_ids"] = mask_ids
         model_inputs["mask_valid"] = mask_valid
         model_inputs["mask_type"] = mask_type
+        if data_dict.get("video") is not None:
+            model_inputs["sample_modality"] = "video"
+        elif data_dict.get("image") is not None:
+            model_inputs["sample_modality"] = "image"
+        else:
+            model_inputs["sample_modality"] = "text"
 
         # print(self.processor.decode(model_inputs["input_ids"][0], skip_special_tokens=True))
         # for token_id, label in zip(model_inputs["input_ids"][0], model_inputs["labels"][0]):

@@ -10,6 +10,7 @@ import torch
 import os
 import json
 import warnings
+import numpy as np
 from .qwen3vl_seg import Qwen3VLSegForConditionalGeneration
 from transformers import (
     AutoConfig,
@@ -28,6 +29,60 @@ from peft import PeftConfig
 from safetensors.torch import load_file
 from .attention_ import *
 from .video_seg_engine import VideoSegEngine
+
+
+class _ManualSam3SegProcessor:
+    """Lightweight SAM3 image preprocessor aligned with sam3_full transforms."""
+
+    def __init__(self, resolution=1008):
+        from PIL import Image
+        from torchvision.transforms import v2
+
+        self._pil_image_cls = Image.Image
+        self.resolution = resolution
+        self.transform = v2.Compose(
+            [
+                v2.ToDtype(torch.uint8, scale=True),
+                v2.Resize(size=(resolution, resolution)),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+
+    class _Output(dict):
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+    def __call__(self, *args, **kwargs):
+        from torchvision.transforms import v2
+
+        if len(args) == 0:
+            raise ValueError("SAM3 processor expects an image input")
+        image = args[0]
+
+        if isinstance(image, self._pil_image_cls):
+            width, height = image.size
+        elif isinstance(image, np.ndarray):
+            height, width = image.shape[:2]
+        elif torch.is_tensor(image):
+            height, width = image.shape[-2:]
+        else:
+            raise ValueError(f"Unsupported image type for SAM3 preprocessing: {type(image)}")
+
+        tensor = v2.functional.to_image(image)
+        pixel_values = self.transform(tensor).unsqueeze(0)
+        return self._Output(
+            {
+                "pixel_values": pixel_values,
+                "original_sizes": [(height, width)],
+            }
+        )
+
+    def __getattr__(self, name):
+        raise AttributeError(name)
 
 def get_model_name_from_path(model_path):
     model_path = model_path.strip("/")
@@ -77,6 +132,18 @@ def _load_manual_qwen3vl_tokenizer_and_processor(model_path):
         chat_template=chat_template,
     )
     return tokenizer, processor
+
+
+def load_sam3_seg_processor(mask_decoder_model):
+    local_files_only = bool(mask_decoder_model and os.path.exists(mask_decoder_model))
+    try:
+        return AutoProcessor.from_pretrained(mask_decoder_model, local_files_only=local_files_only)
+    except Exception as exc:
+        warnings.warn(
+            f"SAM3 processor load failed for {mask_decoder_model}: {exc}. "
+            "Falling back to a local sam3_full-style image preprocessor."
+        )
+        return _ManualSam3SegProcessor()
 
 def load_pretrained_model(model_path, model_base, load_8bit=False, load_4bit=False, device_map="auto", **kwargs):
     model_name = get_model_name_from_path(model_path)

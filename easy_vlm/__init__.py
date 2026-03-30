@@ -2,9 +2,7 @@ from . import models
 from PIL import Image, ImageOps
 import torch
 from qwen_vl_utils import process_vision_info
-from transformers import (
-    AutoProcessor,
-)
+from .models import load_sam3_seg_processor
 
 def disable_torch_init():
     """
@@ -16,7 +14,7 @@ def disable_torch_init():
 
 
 def mm_infer_segmentation(image_path, processor, conversation, model, tokenizer, **kwargs):
-    seg_processor = AutoProcessor.from_pretrained(model.config.mask_decoder_model)
+    seg_processor = load_sam3_seg_processor(model.config.mask_decoder_model)
 
     # sam image
     sam_images = []

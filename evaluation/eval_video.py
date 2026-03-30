@@ -78,9 +78,25 @@ def infer_phrase_from_instruction(instruction):
 def ensure_segmentation_mask_request(instruction):
     suffix = "Please output the segmentation mask."
     stripped = instruction.strip()
-    if suffix.lower() in stripped.lower():
+    if "segmentation mask" in stripped.lower():
         return stripped
     return f"{stripped} {suffix}"
+
+
+def build_instruction_from_expression(expression):
+    normalized = expression.strip().rstrip(".")
+    word_count = len(normalized.split())
+    if normalized.lower().startswith("the ") and word_count >= 8:
+        return ensure_segmentation_mask_request(
+            f"Find {normalized}, then output the segmentation mask."
+        )
+    return ensure_segmentation_mask_request(
+        f"Can you segment '{normalized.lower()}' in the video?"
+    )
+
+
+def _strip_optional_plural(noun_phrase):
+    return re.sub(r"\(s\)", "", noun_phrase).strip()
 
 
 def normalize_expression_for_segmentation(expression):
@@ -88,8 +104,37 @@ def normalize_expression_for_segmentation(expression):
         return None
 
     normalized = expression.strip()
-    if re.match(r"^\s*which\b", normalized, flags=re.IGNORECASE):
-        normalized = re.sub(r"^\s*which\b\s*", "", normalized, count=1, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = normalized.rstrip(".")
+    normalized = re.sub(
+        r",\s*ending\b",
+        " and ends",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    which_match = re.match(
+        r"^\s*which\s+(?P<noun>.+?)\s+(?P<copula>is/are|are|is)\s+(?P<rest>.+?)\??$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if which_match:
+        noun = _strip_optional_plural(which_match.group("noun"))
+        rest = which_match.group("rest").strip().rstrip("?")
+        noun_lower = noun.lower()
+        linker = "who" if noun_lower in {"person", "man", "woman", "boy", "girl", "child"} else "that"
+        copula = "is"
+        normalized = f"the {noun} {linker} {copula} {rest}"
+    elif re.match(r"^\s*which\b", normalized, flags=re.IGNORECASE):
+        normalized = re.sub(
+            r"^\s*which\b\s*",
+            "the ",
+            normalized,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        normalized = _strip_optional_plural(normalized).rstrip("?").strip()
+
     return normalized.strip()
 
 
@@ -152,9 +197,7 @@ class VideoEvalDataset(Dataset):
                 if os.path.isdir(video_abs_path) and len(os.listdir(video_abs_path)) == 0:
                     print(f"Video path does not exist or is empty: {video_abs_path}")
                     continue
-                instruction = ensure_segmentation_mask_request(
-                    f"Can you segment '{normalized_expression.rstrip('.').lower()}' in the video?"
-                )
+                instruction = build_instruction_from_expression(normalized_expression)
                 phrase = normalized_expression.rstrip(".")
             else:
                 instruction = ensure_segmentation_mask_request(data["question"])

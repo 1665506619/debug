@@ -1,4 +1,5 @@
 import pathlib
+import warnings
 import torch
 from transformers.trainer_utils import enable_full_determinism, set_seed
 from transformers import (
@@ -7,12 +8,15 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoProcessor,
     AutoImageProcessor,
-    AutoVideoProcessor,
     AutoTokenizer,
     CONFIG_MAPPING,
     MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING,
     PROCESSOR_MAPPING,
 )
+try:
+    from transformers import AutoVideoProcessor
+except ImportError:
+    AutoVideoProcessor = None
 
 from easy_vlm.training import (
     get_args,
@@ -27,6 +31,10 @@ from easy_vlm.training import (
 import sys
 sys.path.append('./')
 from easy_vlm.models.qwen3vl_seg import Qwen3VLSegForConditionalGeneration
+from easy_vlm.models import (
+    _load_manual_qwen3vl_tokenizer_and_processor,
+    load_sam3_seg_processor,
+)
 from easy_vlm.constants import (REGION_TOKEN, SEG_TOKEN, REF_START_TOKEN, REF_END_TOKEN, SEG_START_TOKEN, SEG_END_TOKEN)
 from .nv import *
 from easy_vlm.models.attention_ import *
@@ -57,20 +65,57 @@ def build_model(args: TrainingArguments):
     dtype = torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)
 
     original_config = AutoConfig.from_pretrained(args.model_path)
+    if hasattr(original_config, "text_config"):
+        rope_parameters = getattr(original_config.text_config, "rope_parameters", None)
+        rope_scaling = getattr(original_config.text_config, "rope_scaling", None)
+        if rope_scaling is None and rope_parameters is not None:
+            original_config.text_config.rope_scaling = dict(rope_parameters)
     enable_full_determinism(args.seed) if args.full_determinism else set_seed(args.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    image_processor = AutoImageProcessor.from_pretrained(args.model_path)
-    video_processor = AutoVideoProcessor.from_pretrained(
-        args.model_path,
-        use_token_compression=args.use_token_compression,
-    )
-    processor = AutoProcessor.from_pretrained(
-        args.model_path,
-        tokenizer=tokenizer,
-        image_processor=image_processor,
-        video_processor=video_processor,
-    )
+    processor = None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
+    except Exception as exc:
+        warnings.warn(
+            f"Fast tokenizer load failed for {args.model_path}: {exc}. Falling back to use_fast=False."
+        )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
+        except Exception as slow_exc:
+            warnings.warn(
+                f"Slow tokenizer load failed for {args.model_path}: {slow_exc}. "
+                "Falling back to manual Qwen3-VL tokenizer/processor construction."
+            )
+            tokenizer, processor = _load_manual_qwen3vl_tokenizer_and_processor(args.model_path)
+
+    if processor is None:
+        image_processor = AutoImageProcessor.from_pretrained(args.model_path)
+        if AutoVideoProcessor is not None:
+            video_processor = AutoVideoProcessor.from_pretrained(
+                args.model_path,
+                use_token_compression=args.use_token_compression,
+            )
+            processor = AutoProcessor.from_pretrained(
+                args.model_path,
+                tokenizer=tokenizer,
+                image_processor=image_processor,
+                video_processor=video_processor,
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(args.model_path)
+            video_processor = getattr(processor, "video_processor", None)
+            if video_processor is None:
+                raise ImportError(
+                    "AutoVideoProcessor is unavailable in this transformers build, "
+                    "and AutoProcessor did not expose a video_processor fallback."
+                )
+            if hasattr(video_processor, "use_token_compression"):
+                video_processor.use_token_compression = args.use_token_compression
+    else:
+        image_processor = processor.image_processor
+        video_processor = processor.video_processor
+        if hasattr(video_processor, "use_token_compression"):
+            video_processor.use_token_compression = args.use_token_compression
 
     processor.tokenizer.add_tokens([REGION_TOKEN], special_tokens=True)
     processor.tokenizer.add_tokens([SEG_TOKEN, REF_START_TOKEN, REF_END_TOKEN, SEG_START_TOKEN, SEG_END_TOKEN], special_tokens=True)
@@ -119,13 +164,18 @@ def build_model(args: TrainingArguments):
         model = get_peft_model(model, lora_config)
 
     if args.mask_decoder_model is not None:
-        seg_processor = AutoProcessor.from_pretrained(args.mask_decoder_model)
+        seg_processor = load_sam3_seg_processor(args.mask_decoder_model)
     else:
         seg_processor = None
 
     if args.mask_decoder_model is not None and 'mm_mask_decoder' not in model.get_model().config:
         print('initialize mask decoder...')
         model.get_model().initialize_mask_decoder(model.get_model().config)
+
+    if args.mask_decoder_model is not None and (args.bf16 or args.fp16):
+        # Keep the SAM3-full grounding path in fp32 for training stability.
+        # Its geometry / positional-encoding stack still relies on float kernels.
+        model.get_model().grounding_model.float()
 
     # for p in model.get_model().parameters():
     #     p.requires_grad = True
@@ -145,18 +195,21 @@ def build_model(args: TrainingArguments):
         for p in model.get_model().visual.merger.parameters():
             p.requires_grad = True
 
+    sam_model = model.get_model().grounding_model.get_sam_model()
+    sam_vision_encoder = model.get_model().grounding_model.get_sam_vision_encoder()
+
     if args.sam_decoder_lr is None or args.sam_decoder_lr==0:
-        for p in model.get_model().grounding_model.model.parameters():
+        for p in sam_model.parameters():
             p.requires_grad = False
     else:
-        for p in model.get_model().grounding_model.model.parameters():
+        for p in sam_model.parameters():
             p.requires_grad = True
 
     if args.sam_encoder_lr is None or args.sam_encoder_lr==0:
-        for p in model.get_model().grounding_model.model.vision_encoder.parameters():
+        for p in sam_vision_encoder.parameters():
             p.requires_grad = False
     else:
-        for p in model.get_model().grounding_model.model.vision_encoder.parameters():
+        for p in sam_vision_encoder.parameters():
             p.requires_grad = False
 
     for n, p in model.named_parameters():

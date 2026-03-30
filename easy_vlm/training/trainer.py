@@ -76,7 +76,7 @@ def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['visual', 'text_hidden_fcs', 'grounding_model', 'class_head', 'mask_hidden_fcs', 'mask_queries']
+    multimodal_keywords = ['visual', 'text_hidden_fcs', 'grounding_model', 'class_head', 'mask_hidden_fcs', 'video_query_projector', 'mask_queries']
     target_keywords = ["q_proj", "k_proj", "v_proj", "o_proj"]
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
@@ -216,9 +216,9 @@ class Trainer(TransformersTrainer):
                     projector_parameters.append((n, p))
                 elif ("vision_model" in n or "visual" in n) and "grounding_model" not in n and "visual.merger" not in n:
                     vision_encoder_parameters.append((n, p))
-                elif "grounding_model.model.vision_encoder" in n:
+                elif "grounding_model.model.vision_encoder" in n or "grounding_model.model.backbone.vision_backbone" in n:
                     mask_encoder_parameters.append((n, p))
-                elif "grounding_model" in n or "text_hidden_fcs" in n or "mask_hidden_fcs" in n or "mask_queries" in n:
+                elif "grounding_model" in n or "text_hidden_fcs" in n or "mask_hidden_fcs" in n or "video_query_projector" in n or "mask_queries" in n:
                     mask_decoder_parameters.append((n, p))
                 else:
                     llm_parameters.append((n, p))
@@ -334,8 +334,9 @@ class Trainer(TransformersTrainer):
                     ]
                 )
 
-            if self.optimizer_cls_and_kwargs is not None:
-                optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+            optimizer_cls_and_kwargs = getattr(self, "optimizer_cls_and_kwargs", None)
+            if optimizer_cls_and_kwargs is not None:
+                optimizer_cls, optimizer_kwargs = optimizer_cls_and_kwargs
             else:
                 optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
 

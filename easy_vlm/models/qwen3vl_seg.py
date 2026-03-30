@@ -30,7 +30,7 @@ from transformers.utils import is_torchdynamo_compiling, can_return_tuple
 from transformers.utils.generic import TransformersKwargs, check_model_inputs
 from transformers.modeling_outputs import ModelOutput
 
-from .utils import load_multimodal_data, cross_entropy_loss, EncoderLoadBalancingHandler, CrossEntropyLoss, DiceLoss, genetate_video_pred_embeddings, process_video_gt_masks, binary_focal_loss_with_logits, projection_loss, get_phrase_embedding, expand_vision_features, get_phrase_ids_by_start_end, dice_score, calculate_mask_loss_group, downsample_to_max_hw, select_vision_outputs, resize_pred_and_gt_for_loss
+from .utils import load_multimodal_data, cross_entropy_loss, EncoderLoadBalancingHandler, CrossEntropyLoss, DiceLoss, genetate_video_pred_embeddings, process_video_gt_masks, binary_focal_loss_with_logits, projection_loss, get_phrase_embedding, get_phrase_ids_by_start_end, dice_score, calculate_mask_loss_group, downsample_to_max_hw, resize_pred_and_gt_for_loss
 from .segmentation_decoder import SegmentationDecoder
 from .assigner import HungarianAssigner
 from easy_vlm.constants import IGNORE_INDEX
@@ -350,7 +350,12 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         if len(self.seg_output_embeddings) == 0:
             return None
         seg_output_embeddings = torch.cat(self.seg_output_embeddings, dim=0)
-        return self.model.mask_hidden_fcs[0](seg_output_embeddings)
+        return self.model.video_query_projector(seg_output_embeddings)
+
+    def _select_seg_query_projector(self, modality: Optional[str] = None):
+        if modality == "video":
+            return self.model.video_query_projector
+        return self.model.mask_hidden_fcs[0]
 
     def _extract_ref_phrase_token_ids(self, output_ids):
         start_token_id = self.config.ref_start_token_index
@@ -419,6 +424,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         mask_type = None,
         phrase_ids = None,
         data_indices = None,
+        modalities = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         # print('input_ids', input_ids.shape)
@@ -461,7 +467,6 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             
             mask_valid_ = False
             if masks[0] is not None:
-                hidden_states_sam = self.model.mask_hidden_fcs[0](hidden_states)
                 g_pixel_values = torch.stack(sam_images, dim=0)  # [bs, C, H, W]
                 with torch.no_grad():
                     vision_outputs_batch = self.model.grounding_model.encoder(g_pixel_values)
@@ -476,8 +481,15 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     pred_masks = []
                     input_id = input_ids[i]
                     seg_token_mask = input_id==self.config.seg_token_index
-                    
-                    pred_embedding = hidden_states_sam[i][seg_token_mask]
+
+                    sample_modality = None
+                    if modalities is not None:
+                        sample_modality = modalities[i]
+                    elif pixel_values_videos is not None and pixel_values is None:
+                        sample_modality = "video"
+
+                    projector = self._select_seg_query_projector(sample_modality)
+                    pred_embedding = projector(hidden_states[i])[seg_token_mask]
                     pred_embedding = pred_embedding.reshape(-1, self.config.max_seg_nums, pred_embedding.shape[-1])
                     # print('pred_embedding shape:', pred_embedding.shape) # [num_seg, max_seg_nums, dim]
 
@@ -490,7 +502,9 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
                     g_pixel_values = sam_images[i].unsqueeze(0)
 
-                    vision_outputs = select_vision_outputs(vision_outputs_batch, i)
+                    vision_outputs = self.model.grounding_model.select_vision_outputs(
+                        vision_outputs_batch, i
+                    )
 
                     obj_num = pred_embedding.shape[0]
 
@@ -516,10 +530,8 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                             chunk_size = end - start
 
                             pred_embedding_chunk = pred_embedding[start:end]  # [chunk, max_seg_nums, dim]（按你原实现）
-                            vision_outputs_expand = expand_vision_features(vision_outputs, chunk_size)
-
                             mask_outputs_chunk = self.model.grounding_model.decoder(
-                                vision_outputs_expand,
+                                vision_outputs,
                                 phrase_embedding[start:end],
                                 text_attn_mask[start:end],
                                 pred_embedding_chunk
@@ -595,7 +607,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                                     cls_sum = cls_sum + cls_
                                 num_cls += 1
 
-                            # del mask_outputs_chunk, pred_masks_chunk, pred_logits_chunk, vision_outputs_expand, pred_embedding_chunk
+                            # del mask_outputs_chunk, pred_masks_chunk, pred_logits_chunk, pred_embedding_chunk
 
                 if mask_bce_sum is not None:
                     mask_bce_loss = mask_bce_sum / num_masks
@@ -687,14 +699,17 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
                 obj_num = pred_embeddings.shape[0]
                 
-                vision_outputs_expand = expand_vision_features(vision_outputs, obj_num)
-
                 phrase_id, text_attn_mask = get_phrase_ids_by_start_end(output_ids, self.config.ref_start_token_index, self.config.ref_end_token_index)
 
                 phrase_embedding = self.model.get_input_embeddings()(phrase_id)
                 phrase_embedding = self.model.text_hidden_fcs[0](phrase_embedding)
 
-                mask_outputs = self.model.grounding_model.decoder(vision_outputs_expand, phrase_embedding, text_attn_mask, pred_embeddings)
+                mask_outputs = self.model.grounding_model.decoder(
+                    vision_outputs,
+                    phrase_embedding,
+                    text_attn_mask,
+                    pred_embeddings,
+                )
 
                 pred_masks = mask_outputs['pred_masks'] # [9,10,288,288]
                 pred_logits = mask_outputs['pred_logits'].sigmoid()
