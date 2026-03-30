@@ -74,6 +74,7 @@ set -x
   --use_multi_objs False \
   --skip_none False \
   --attn_implementation sdpa \
+  --max_seg_nums 10 \
   --bf16 True \
   --fp16 False \
   --tf32 True \

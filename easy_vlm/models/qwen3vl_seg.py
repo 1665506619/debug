@@ -122,6 +122,10 @@ class Qwen3VLSegModel(_Qwen3VLModel):
         self.video_query_projector.train()
         for param in self.video_query_projector.parameters():
             param.requires_grad = True
+        # Start video training from the learned image-query space and only learn
+        # a gated residual on top, so video finetuning does not need to relearn
+        # the full segmentation query projection from scratch.
+        self.video_query_alpha = nn.Parameter(torch.zeros(1))
 
         self.mask_queries = nn.Parameter(torch.zeros(config.max_seg_nums, config.text_config.hidden_size))  
 
@@ -350,12 +354,14 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         if len(self.seg_output_embeddings) == 0:
             return None
         seg_output_embeddings = torch.cat(self.seg_output_embeddings, dim=0)
-        return self.model.video_query_projector(seg_output_embeddings)
+        return self._project_seg_queries(seg_output_embeddings, modality="video")
 
-    def _select_seg_query_projector(self, modality: Optional[str] = None):
+    def _project_seg_queries(self, seg_output_embeddings, modality: Optional[str] = None):
+        image_queries = self.model.mask_hidden_fcs[0](seg_output_embeddings)
         if modality == "video":
-            return self.model.video_query_projector
-        return self.model.mask_hidden_fcs[0]
+            video_delta = self.model.video_query_projector(seg_output_embeddings)
+            return image_queries + self.model.video_query_alpha * video_delta
+        return image_queries
 
     def _extract_ref_phrase_token_ids(self, output_ids):
         start_token_id = self.config.ref_start_token_index
@@ -488,8 +494,10 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     elif pixel_values_videos is not None and pixel_values is None:
                         sample_modality = "video"
 
-                    projector = self._select_seg_query_projector(sample_modality)
-                    pred_embedding = projector(hidden_states[i])[seg_token_mask]
+                    pred_embedding = self._project_seg_queries(
+                        hidden_states[i],
+                        modality=sample_modality,
+                    )[seg_token_mask]
                     pred_embedding = pred_embedding.reshape(-1, self.config.max_seg_nums, pred_embedding.shape[-1])
                     # print('pred_embedding shape:', pred_embedding.shape) # [num_seg, max_seg_nums, dim]
 
@@ -740,6 +748,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         self.SEG_START = None
         self.seg_output_embeddings = []
         kwargs.pop("mm_token_type_ids", None)
+        kwargs.setdefault("use_cache", False)
         outputs = self.generate(**kwargs)
         input_ids = kwargs["input_ids"]
         output_ids = outputs.sequences
@@ -771,7 +780,13 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
             if external_query_embeds is None:
                 raise ValueError("no external query embeddings found for video inference")
-            num_segments = min(len(phrase_texts), external_query_embeds.shape[0])
+            if len(phrase_texts) != external_query_embeds.shape[0]:
+                raise ValueError(
+                    "video inference expects the number of decoded phrases to match the "
+                    f"number of external query groups. got phrases={len(phrase_texts)}, "
+                    f"query_groups={external_query_embeds.shape[0]}"
+                )
+            num_segments = len(phrase_texts)
             video_results = []
             for seg_idx in range(num_segments):
                 video_results.append(

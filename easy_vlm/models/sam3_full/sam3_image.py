@@ -303,10 +303,11 @@ class Sam3Image(torch.nn.Module):
             query_count = external_query_embed.shape[0]
             if query_count <= 0:
                 raise ValueError("external_query_embed must provide at least one query slot")
-            if query_count > self.transformer.decoder.reference_points.num_embeddings:
+            expected_query_count = self.transformer.decoder.reference_points.num_embeddings
+            if query_count > expected_query_count:
                 raise ValueError(
                     "external_query_embed provides more queries than sam3_full reference points: "
-                    f"{query_count} > {self.transformer.decoder.reference_points.num_embeddings}"
+                    f"{query_count} > {expected_query_count}"
                 )
             tgt = external_query_embed
             reference_boxes = self.transformer.decoder.reference_points.weight[:query_count]

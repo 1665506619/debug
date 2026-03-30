@@ -242,6 +242,9 @@ class SegmentationDecoder(nn.Module):
     def get_sam_model(self):
         return self.model
 
+    def get_num_queries(self):
+        return self.model.transformer.decoder.num_queries
+
     def get_sam_vision_encoder(self):
         return self.model.backbone.vision_backbone
 
@@ -272,6 +275,12 @@ class SegmentationDecoder(nn.Module):
         if query_embed.dim() != 3:
             raise ValueError(
                 f"query_embed must be [num_prompts, num_queries, dim], got shape {tuple(query_embed.shape)}"
+            )
+        expected_num_queries = self.get_num_queries()
+        if query_embed.shape[1] > expected_num_queries:
+            raise ValueError(
+                "sam3_full cannot consume more external Qwen queries than its learned decoder slots: "
+                f"got {query_embed.shape[1]}, max supported {expected_num_queries}."
             )
 
         num_prompts = text_embeds.shape[0]

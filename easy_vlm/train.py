@@ -172,6 +172,15 @@ def build_model(args: TrainingArguments):
         print('initialize mask decoder...')
         model.get_model().initialize_mask_decoder(model.get_model().config)
 
+    if args.mask_decoder_model is not None:
+        sam_num_queries = model.get_model().grounding_model.get_num_queries()
+        if model.get_model().config.max_seg_nums > sam_num_queries:
+            raise ValueError(
+                "max_seg_nums cannot exceed the sam3_full decoder query count. "
+                f"got max_seg_nums={model.get_model().config.max_seg_nums}, "
+                f"sam3_full.num_queries={sam_num_queries}."
+            )
+
     if args.mask_decoder_model is not None and (args.bf16 or args.fp16):
         # Keep the SAM3-full grounding path in fp32 for training stability.
         # Its geometry / positional-encoding stack still relies on float kernels.
