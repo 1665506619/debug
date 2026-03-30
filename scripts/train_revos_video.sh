@@ -48,14 +48,15 @@ mkdir -p "$(dirname "${TRAIN_JSON}")" "${OUTPUT_DIR}"
 
 if [ -z "${SAM3_MODEL}" ]; then
   echo "SAM3_MODEL is not set."
-  echo "Please point it to a local SAM3 model directory that contains config/processor/weights."
-  echo "Example:"
+  echo "Please point it to a local SAM3 checkpoint file or model directory."
+  echo "Examples:"
+  echo "  SAM3_MODEL=weights/sam3/sam3.pt bash debug/scripts/train_revos_video.sh"
   echo "  SAM3_MODEL=/path/to/local/sam3_dir bash debug/scripts/train_revos_video.sh"
   exit 1
 fi
 
-if [ ! -d "${SAM3_MODEL}" ]; then
-  echo "SAM3_MODEL must be a local directory, got: ${SAM3_MODEL}"
+if [ ! -e "${SAM3_MODEL}" ]; then
+  echo "SAM3_MODEL path does not exist: ${SAM3_MODEL}"
   exit 1
 fi
 
