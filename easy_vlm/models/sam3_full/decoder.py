@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from sam3.sam.transformer import RoPEAttention
 from torch import nn, Tensor
 from torchvision.ops.roi_align import RoIAlign
 
@@ -23,6 +22,7 @@ from .model_misc import (
     inverse_sigmoid,
     MLP,
 )
+from .sam.transformer import RoPEAttention
 
 
 class TransformerDecoderLayer(nn.Module):

@@ -8,9 +8,10 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 
 import numpy as np
 import torch
-from sam3.model.box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 from scipy.optimize import linear_sum_assignment
 from torch import nn
+
+from ..box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 
 
 def _do_matching(cost, repeats=1, return_tgt_indices=False, do_filtering=False):

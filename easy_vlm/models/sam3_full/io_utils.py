@@ -14,8 +14,9 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
-from sam3.logger import get_logger
 from tqdm import tqdm
+
+from .logger import get_logger
 
 logger = get_logger(__name__)
 

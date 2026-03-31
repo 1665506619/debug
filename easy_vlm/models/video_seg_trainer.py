@@ -137,26 +137,24 @@ class VideoSegTrainer(nn.Module):
 
 
 def build_video_seg_trainer(config):
-    import pkg_resources
     from iopath.common.file_io import g_pathmgr
-    from sam3.model.sam3_image import Sam3ImageOnVideoMultiGPU
-    from sam3.model.model_misc import DotProductScoring, MLP
-    from sam3.model.vl_combiner import SAM3VLBackbone
-    from sam3.model_builder import (
+    from .sam3_full.builders import (
         _create_geometry_encoder,
         _create_segmentation_head,
         _create_sam3_transformer,
         _create_text_encoder,
         _create_vision_backbone,
+        resolve_sam3_bpe_path,
         build_tracker,
     )
+    from .sam3_full.model_misc import DotProductScoring, MLP
+    from .sam3_full.sam3_image import Sam3ImageOnVideoMultiGPU
+    from .sam3_full.vl_combiner import SAM3VLBackbone
 
     checkpoint_path = _resolve_sam3_checkpoint_path(
         getattr(config, "mask_decoder_model", None)
     )
-    bpe_path = pkg_resources.resource_filename(
-        "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-    )
+    bpe_path = resolve_sam3_bpe_path()
     tracker = build_tracker(apply_temporal_disambiguation=True)
 
     visual_neck = _create_vision_backbone()

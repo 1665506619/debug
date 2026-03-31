@@ -105,8 +105,8 @@ def _patch_geometry_encoder_dtype_compat(geometry_encoder):
         return type_embed + points_embed, points_mask
 
     def _encode_boxes(self, boxes, boxes_mask, boxes_labels, img_feats):
-        from sam3.model.geometry_encoders import box_cxcywh_to_xyxy
         import torchvision
+        from .sam3_full.geometry_encoders import box_cxcywh_to_xyxy
 
         boxes_embed = None
         n_boxes, bs = boxes.shape[:2]
@@ -166,11 +166,10 @@ def _patch_geometry_encoder_dtype_compat(geometry_encoder):
 
 
 def _create_sam3_full_transformer(num_queries):
-    import pkg_resources
-    from sam3 import model_builder as sam3_builder
-    from sam3.model.decoder import TransformerDecoder, TransformerDecoderLayer
-    from sam3.model.model_misc import MultiheadAttentionWrapper as MultiheadAttention
-    from sam3.model.model_misc import TransformerWrapper
+    from .sam3_full import builders as sam3_builder
+    from .sam3_full.decoder import TransformerDecoder, TransformerDecoderLayer
+    from .sam3_full.model_misc import MultiheadAttentionWrapper as MultiheadAttention
+    from .sam3_full.model_misc import TransformerWrapper
 
     if num_queries <= 0:
         raise ValueError(f"num_queries must be positive, got {num_queries}")
@@ -233,12 +232,11 @@ def _load_sam3_full_checkpoint(model, checkpoint_path):
 
 
 def _build_sam3_full_image_model(checkpoint_path, training, num_queries):
-    import pkg_resources
-    from sam3 import model_builder as sam3_builder
+    from .sam3_full import builders as sam3_builder
 
     from .sam3_full.sam3_image import Sam3Image
 
-    bpe_path = pkg_resources.resource_filename("sam3", "assets/bpe_simple_vocab_16e6.txt.gz")
+    bpe_path = sam3_builder.resolve_sam3_bpe_path()
 
     vision_encoder = sam3_builder._create_vision_backbone(
         compile_mode=None,
@@ -329,8 +327,7 @@ class SegmentationDecoder(nn.Module):
         return {"backbone_out": _slice_backbone_out(vision_outputs_batch["backbone_out"], idx)}
 
     def decoder(self, vision_outputs, text_embeds, text_attn_mask, query_embed):
-        from sam3.model.data_misc import FindStage
-
+        from .sam3_full.data_misc import FindStage
         from .sam3_full.geometry_encoders import Prompt
 
         if text_embeds.dim() != 3:

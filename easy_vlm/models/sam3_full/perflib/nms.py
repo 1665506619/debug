@@ -1,0 +1,59 @@
+import logging
+
+import numpy as np
+import torch
+
+from .masks_ops import mask_iou
+
+
+try:
+    from torch_generic_nms import generic_nms as generic_nms_cuda
+
+    GENERIC_NMS_AVAILABLE = True
+except ImportError:
+    logging.debug("torch_generic_nms not found, falling back to CPU generic NMS.")
+    GENERIC_NMS_AVAILABLE = False
+
+
+def nms_masks(
+    pred_probs: torch.Tensor,
+    pred_masks: torch.Tensor,
+    prob_threshold: float,
+    iou_threshold: float,
+) -> torch.Tensor:
+    is_valid = pred_probs > prob_threshold
+    probs = pred_probs[is_valid]
+    masks_binary = pred_masks[is_valid] > 0
+    if probs.numel() == 0:
+        return is_valid
+
+    ious = mask_iou(masks_binary, masks_binary)
+    kept_inds = generic_nms(ious, probs, iou_threshold)
+    valid_inds = torch.where(is_valid, is_valid.cumsum(dim=0) - 1, -1)
+    return torch.isin(valid_inds, kept_inds)
+
+
+def generic_nms(
+    ious: torch.Tensor, scores: torch.Tensor, iou_threshold=0.5
+) -> torch.Tensor:
+    assert ious.dim() == 2 and ious.size(0) == ious.size(1)
+    assert scores.dim() == 1 and scores.size(0) == ious.size(0)
+
+    if ious.is_cuda and GENERIC_NMS_AVAILABLE:
+        return generic_nms_cuda(ious, scores, iou_threshold, use_iou_matrix=True)
+    return generic_nms_cpu(ious, scores, iou_threshold)
+
+
+def generic_nms_cpu(
+    ious: torch.Tensor, scores: torch.Tensor, iou_threshold=0.5
+) -> torch.Tensor:
+    ious_np = ious.float().detach().cpu().numpy()
+    scores_np = scores.float().detach().cpu().numpy()
+    order = scores_np.argsort()[::-1]
+    kept_inds = []
+    while order.size > 0:
+        i = order.item(0)
+        kept_inds.append(i)
+        inds = np.where(ious_np[i, order[1:]] <= iou_threshold)[0]
+        order = order[inds + 1]
+    return torch.tensor(kept_inds, dtype=torch.int64, device=scores.device)
