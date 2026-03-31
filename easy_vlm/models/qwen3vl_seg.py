@@ -536,6 +536,12 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
         with torch.no_grad():
             union_gt_mask = gt_masks_cur.any(dim=0).to(pred_masks_cur.dtype)
+            if union_gt_mask.shape != pred_masks_cur.shape[-2:]:
+                union_gt_mask = F.interpolate(
+                    union_gt_mask.unsqueeze(0).unsqueeze(0),
+                    size=pred_masks_cur.shape[-2:],
+                    mode="nearest",
+                ).squeeze(0).squeeze(0)
             selection_targets = []
             for pred_mask in pred_masks_cur:
                 q_score = dice_score(pred_mask.sigmoid(), union_gt_mask)
