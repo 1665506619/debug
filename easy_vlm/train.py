@@ -182,6 +182,12 @@ def build_model(args: TrainingArguments):
     original_config.bce_loss_weight = 2.0
     original_config.cls_loss_weight = 1.0
     original_config.loss_sample_points = args.loss_sample_points
+    # Temporary training override: always use the SAM3 native video loss path.
+    # Keep box loss disabled for now and preserve stage normalization while
+    # we validate training stability against the legacy video loss.
+    original_config.use_sam3_native_video_loss = True
+    original_config.sam3_native_video_use_box_loss = False
+    original_config.sam3_native_video_normalize_by_stage_num = True
 
     model = Qwen3VLSegForConditionalGeneration.from_pretrained(
         args.model_path,
