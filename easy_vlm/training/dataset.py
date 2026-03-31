@@ -521,10 +521,21 @@ class SFTDataset(Dataset):
         if os.path.isabs(path_value):
             return path_value
 
+        cwd_resolved = os.path.abspath(path_value)
+        if os.path.exists(cwd_resolved):
+            return cwd_resolved
+
+        direct_resolved = self._resolve_local_path(path_value)
+        if os.path.exists(direct_resolved):
+            return direct_resolved
+
         source_json_path = data_dict.get("__source_json_path")
         if source_json_path is not None:
-            return os.path.join(os.path.dirname(source_json_path), path_value)
-        return self._resolve_local_path(path_value)
+            source_resolved = os.path.join(os.path.dirname(source_json_path), path_value)
+            if os.path.exists(source_resolved):
+                return source_resolved
+            return source_resolved
+        return direct_resolved
 
     def _load_revos_video_meta(self, path):
         resolved_path = os.path.abspath(path)

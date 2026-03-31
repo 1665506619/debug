@@ -142,6 +142,10 @@ def build_model(args: TrainingArguments):
         config=original_config,
         dtype=dtype,
         attn_implementation=args.attn_implementation,
+        # Building the SAM3 grounding branch inside HF's meta-init context can
+        # crash on tensor.item()/torch.linspace paths. Use a real materialized
+        # load during training model construction.
+        low_cpu_mem_usage=False,
     )
 
 
@@ -185,6 +189,19 @@ def build_model(args: TrainingArguments):
         # Keep the SAM3-full grounding path in fp32 for training stability.
         # Its geometry / positional-encoding stack still relies on float kernels.
         model.get_model().grounding_model.float()
+        # The query/text projection heads feed the fp32 grounding decoder and can
+        # overflow in bf16 on video samples. Keep them in fp32 as well.
+        model.get_model().text_hidden_fcs.float()
+        model.get_model().mask_hidden_fcs.float()
+        model.get_model().video_query_projector.float()
+
+    if hasattr(model.get_model(), "video_query_alpha"):
+        # Video finetuning is designed to start from the learned image-query
+        # space and only learn a gated residual on top. Make that explicit at
+        # training build time so stale checkpoint values cannot destabilize the
+        # first forward.
+        with torch.no_grad():
+            model.get_model().video_query_alpha.zero_()
 
     # for p in model.get_model().parameters():
     #     p.requires_grad = True

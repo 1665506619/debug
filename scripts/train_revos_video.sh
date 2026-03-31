@@ -85,7 +85,7 @@ export OMP_NUM_THREADS
   --seg_decoder sam3 \
   --ann_path "${TRAIN_JSON}" \
   --data_root "${DATA_ROOT}" \
-  --data_path_root / \
+  --data_path_root "${REPO_ROOT}" \
   --data_cache_dir "${OUTPUT_DIR}/hf_cache" \
   --output_dir "${OUTPUT_DIR}" \
   --run_name "${RUN_NAME}" \

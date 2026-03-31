@@ -147,6 +147,7 @@ def _make_training_args(
     output_dir: Path,
     ann_path: Optional[Path] = None,
 ):
+    repo_root = _repo_root()
     ann_list = [str(ann_path)] if ann_path is not None else ["dummy.json"]
     kwargs = dict(
         output_dir=str(output_dir),
@@ -154,7 +155,7 @@ def _make_training_args(
         mask_decoder_model=args.mask_decoder_model,
         ann_path=ann_list,
         data_root=args.data_root,
-        data_path_root="/",
+        data_path_root=str(repo_root),
         data_cache_dir=str(output_dir / "hf_cache"),
         max_seg_nums=args.max_seg_nums,
         seg_encoder="sam3",

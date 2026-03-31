@@ -126,6 +126,10 @@ class HungarianAssigner():
           cost(pred_masks, gt_masks, pred_logits) for cost in self.match_costs
         ]
         cost = torch.stack(cost_list).sum(dim=0)
+        # Guard Hungarian matching from bf16 / early-training numeric spikes.
+        # Invalid entries are treated as very high assignment cost rather than
+        # crashing the whole training step.
+        cost = torch.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
 
         # Hungarian matching
         cost = cost.detach().cpu().numpy()

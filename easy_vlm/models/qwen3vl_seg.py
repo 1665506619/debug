@@ -381,10 +381,13 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         return self._project_seg_queries(seg_output_embeddings, modality="video")
 
     def _project_seg_queries(self, seg_output_embeddings, modality: Optional[str] = None):
-        image_queries = self.model.mask_hidden_fcs[0](seg_output_embeddings)
+        mask_hidden_dtype = next(self.model.mask_hidden_fcs[0].parameters()).dtype
+        image_queries = self.model.mask_hidden_fcs[0](seg_output_embeddings.to(mask_hidden_dtype))
         if modality == "video":
-            video_delta = self.model.video_query_projector(seg_output_embeddings)
-            return image_queries + self.model.video_query_alpha * video_delta
+            video_projector_dtype = next(self.model.video_query_projector.parameters()).dtype
+            video_delta = self.model.video_query_projector(seg_output_embeddings.to(video_projector_dtype))
+            alpha = self.model.video_query_alpha.to(image_queries.dtype)
+            return image_queries + alpha * video_delta.to(image_queries.dtype)
         return image_queries
 
     def _extract_ref_phrase_token_ids(self, output_ids):
@@ -530,7 +533,10 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
                     phrase_id = input_ids.new_tensor(phrase_ids[i])
                     phrase_embedding = self.model.get_input_embeddings()(phrase_id)
-                    phrase_embedding = self.model.text_hidden_fcs[0](phrase_embedding.unsqueeze(0)).squeeze(0)
+                    text_hidden_dtype = next(self.model.text_hidden_fcs[0].parameters()).dtype
+                    phrase_embedding = self.model.text_hidden_fcs[0](
+                        phrase_embedding.unsqueeze(0).to(text_hidden_dtype)
+                    ).squeeze(0)
                 
                     gt_mask = masks[i]
                     sample_mask_valid = True if masks_valid is None else bool(masks_valid[i])
@@ -740,7 +746,8 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 phrase_id, text_attn_mask = get_phrase_ids_by_start_end(output_ids, self.config.ref_start_token_index, self.config.ref_end_token_index)
 
                 phrase_embedding = self.model.get_input_embeddings()(phrase_id)
-                phrase_embedding = self.model.text_hidden_fcs[0](phrase_embedding)
+                text_hidden_dtype = next(self.model.text_hidden_fcs[0].parameters()).dtype
+                phrase_embedding = self.model.text_hidden_fcs[0](phrase_embedding.to(text_hidden_dtype))
 
                 mask_outputs = self.model.grounding_model.decoder(
                     vision_outputs,
