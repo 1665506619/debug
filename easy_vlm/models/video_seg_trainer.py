@@ -136,7 +136,7 @@ class VideoSegTrainer(nn.Module):
         }
 
 
-def build_video_seg_trainer(config, shared_detector: Optional[nn.Module] = None):
+def build_video_seg_trainer(config):
     import pkg_resources
     from iopath.common.file_io import g_pathmgr
     from sam3.model.sam3_image import Sam3ImageOnVideoMultiGPU
@@ -193,11 +193,6 @@ def build_video_seg_trainer(config, shared_detector: Optional[nn.Module] = None)
         dot_prod_scoring=main_dot_prod_scoring,
         supervise_joint_box_scores=True,
     )
-    if shared_detector is not None:
-        # The image grounding decoder and the video detector do not share the same
-        # module type or execution API, so keep the dedicated video detector here.
-        pass
-
     sam3_video_model = Sam3VideoInferenceWithInstanceInteractivity(
         detector=detector,
         tracker=tracker,

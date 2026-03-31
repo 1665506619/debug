@@ -361,21 +361,23 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
         from .video_seg_trainer import build_video_seg_trainer
 
-        shared_detector = self.model.grounding_model.get_sam_model()
         self.video_propagation_trainer = build_video_seg_trainer(
             self.config,
-            shared_detector=shared_detector,
         )
         return self.video_propagation_trainer
 
     def _compute_assigned_mask_losses(
         self,
         pred_masks: torch.Tensor,
-        pred_scores: torch.Tensor,
+        pred_score_logits: torch.Tensor,
         gt_masks: torch.Tensor,
         mask_type_value: int,
     ):
-        if gt_masks.numel() == 0 or pred_masks.numel() == 0 or pred_scores.numel() == 0:
+        if (
+            gt_masks.numel() == 0
+            or pred_masks.numel() == 0
+            or pred_score_logits.numel() == 0
+        ):
             return {
                 "mask_bce_sum": None,
                 "mask_dice_sum": None,
@@ -387,7 +389,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         assign_id = self.assigner.assign(
             pred_masks.float(),
             gt_masks.float(),
-            pred_scores.float(),
+            pred_score_logits.float(),
         )
 
         mask_bce_sum = None
@@ -395,7 +397,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         cls_sum = None
         num_masks = 0
 
-        score_targets = torch.zeros_like(pred_scores)
+        score_targets = torch.zeros_like(pred_score_logits)
         for pred_idx, assigned_gt_idx in enumerate(assign_id):
             if assigned_gt_idx == -1:
                 continue
@@ -433,9 +435,9 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             )
             score_targets[pred_idx] = max(q_score.item(), 0.1)
 
-        if pred_scores.numel() > 0:
-            cls_sum = F.binary_cross_entropy(
-                pred_scores.clamp(min=1e-6, max=1 - 1e-6),
+        if pred_score_logits.numel() > 0:
+            cls_sum = F.binary_cross_entropy_with_logits(
+                pred_score_logits,
                 score_targets,
                 reduction="mean",
             )
@@ -540,7 +542,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     continue
 
                 pred_masks_cur = frame_out["pred_mask_logits"]
-                pred_scores_cur = frame_out["out_probs"]
+                pred_score_logits_cur = frame_out["out_score_logits"]
                 if pred_masks_cur is None or pred_masks_cur.shape[0] == 0:
                     continue
 
@@ -555,7 +557,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 )
                 frame_losses = self._compute_assigned_mask_losses(
                     pred_masks_cur,
-                    pred_scores_cur,
+                    pred_score_logits_cur,
                     gt_masks_cur,
                     mask_type_value,
                 )
@@ -868,7 +870,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                             batch_has_valid_mask_supervision = True
                             frame_losses = self._compute_assigned_mask_losses(
                                 pred_masks_cur,
-                                pred_scores_cur.sigmoid(),
+                                pred_scores_cur,
                                 gt_masks_cur,
                                 mask_type[i],
                             )

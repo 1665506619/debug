@@ -396,6 +396,9 @@ class Sam3VideoBase(nn.Module):
             "bbox": pred_boxes_xyxy[pos_pred_idx[0], pos_pred_idx[1]],
             "mask": pred_masks[pos_pred_idx[0], pos_pred_idx[1]],
             "scores": pred_probs[pos_pred_idx[0], pos_pred_idx[1]],
+            "score_logits": sam3_image_out["pred_logits"].squeeze(-1)[
+                pos_pred_idx[0], pos_pred_idx[1]
+            ],
         }
 
         # Step 3: build SAM2 backbone features and store them in `feature_cache`
@@ -1107,16 +1110,28 @@ class Sam3VideoBase(nn.Module):
                 dtype=det_out["mask"].dtype,
             )
             empty_scores = torch.zeros(0, device=device, dtype=det_out["scores"].dtype)
+            empty_score_logits = torch.zeros(
+                0,
+                device=device,
+                dtype=det_out["score_logits"].dtype,
+            )
             empty_ids = torch.zeros(0, device=device, dtype=torch.long)
             return {
                 "frame_idx": frame_idx,
                 "out_obj_ids": empty_ids,
                 "pred_mask_logits": empty_masks,
                 "out_probs": empty_scores,
+                "out_score_logits": empty_score_logits,
             }
 
         pred_mask_logits = torch.cat(mask_logits, dim=0)
         out_probs = torch.cat(score_probs, dim=0)
+        out_score_logits_list = []
+        if tracker_low_res_masks_global.shape[0] > 0:
+            out_score_logits_list.append(tracker_obj_scores_global)
+        if len(new_det_obj_ids) > 0:
+            out_score_logits_list.append(det_out["score_logits"][new_det_fa_inds_t])
+        out_score_logits = torch.cat(out_score_logits_list, dim=0)
         out_obj_ids = torch.tensor(obj_ids, dtype=torch.long, device=pred_mask_logits.device)
 
         if reconditioned_obj_ids:
@@ -1143,6 +1158,7 @@ class Sam3VideoBase(nn.Module):
             "out_obj_ids": out_obj_ids,
             "pred_mask_logits": pred_mask_logits,
             "out_probs": out_probs,
+            "out_score_logits": out_score_logits,
         }
 
     def _get_objects_to_suppress_based_on_most_recently_occluded(

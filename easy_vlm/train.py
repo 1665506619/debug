@@ -235,21 +235,31 @@ def build_model(args: TrainingArguments):
         for p in sam_model.parameters():
             p.requires_grad = False
         if video_propagation_trainer is not None:
+            for p in video_propagation_trainer.sam3_video_model.detector.parameters():
+                p.requires_grad = False
             for p in video_propagation_trainer.sam3_video_model.tracker.parameters():
                 p.requires_grad = False
     else:
         for p in sam_model.parameters():
             p.requires_grad = True
         if video_propagation_trainer is not None:
+            for p in video_propagation_trainer.sam3_video_model.detector.parameters():
+                p.requires_grad = True
             for p in video_propagation_trainer.sam3_video_model.tracker.parameters():
                 p.requires_grad = True
 
     if args.sam_encoder_lr is None or args.sam_encoder_lr==0:
         for p in sam_vision_encoder.parameters():
             p.requires_grad = False
+        if video_propagation_trainer is not None:
+            for p in video_propagation_trainer.sam3_video_model.detector.backbone.vision_backbone.parameters():
+                p.requires_grad = False
     else:
         for p in sam_vision_encoder.parameters():
             p.requires_grad = True
+        if video_propagation_trainer is not None:
+            for p in video_propagation_trainer.sam3_video_model.detector.backbone.vision_backbone.parameters():
+                p.requires_grad = True
 
     for n, p in model.named_parameters():
         if any(
@@ -263,7 +273,6 @@ def build_model(args: TrainingArguments):
                     "video_query_projector",
                     "video_query_alpha",
                     "mask_queries",
-                    "video_propagation_trainer",
                 ]
             ]
         ):

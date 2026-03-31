@@ -216,7 +216,11 @@ class Trainer(TransformersTrainer):
                     projector_parameters.append((n, p))
                 elif ("vision_model" in n or "visual" in n) and "grounding_model" not in n and "visual.merger" not in n:
                     vision_encoder_parameters.append((n, p))
-                elif "grounding_model.model.vision_encoder" in n or "grounding_model.model.backbone.vision_backbone" in n:
+                elif (
+                    "grounding_model.model.vision_encoder" in n
+                    or "grounding_model.model.backbone.vision_backbone" in n
+                    or "video_propagation_trainer.sam3_video_model.detector.backbone.vision_backbone" in n
+                ):
                     mask_encoder_parameters.append((n, p))
                 elif "grounding_model" in n or "text_hidden_fcs" in n or "mask_hidden_fcs" in n or "video_query_projector" in n or "video_query_alpha" in n or "mask_queries" in n or "video_propagation_trainer" in n:
                     mask_decoder_parameters.append((n, p))
