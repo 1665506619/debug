@@ -278,6 +278,9 @@ class SegmentationDecoder(nn.Module):
     def __init__(self, config):
         super(SegmentationDecoder, self).__init__()
         self.config = config
+        grounding_num_queries = getattr(
+            self.config, "grounding_num_queries", self.config.max_seg_nums
+        )
         if config.seg_encoder == "sam3" and config.seg_decoder == "sam3":
             checkpoint_path = _resolve_sam3_checkpoint_path(
                 getattr(self.config, "mask_decoder_model", None)
@@ -285,7 +288,7 @@ class SegmentationDecoder(nn.Module):
             self.model = _build_sam3_full_image_model(
                 checkpoint_path=checkpoint_path,
                 training=self.training,
-                num_queries=self.config.max_seg_nums,
+                num_queries=grounding_num_queries,
             )
         else:
             raise NotImplementedError
@@ -300,10 +303,11 @@ class SegmentationDecoder(nn.Module):
         checkpoint_path = _resolve_sam3_checkpoint_path(
             getattr(self.config, "mask_decoder_model", None)
         )
+        grounding_num_queries = getattr(config, "grounding_num_queries", config.max_seg_nums)
         self.model = _build_sam3_full_image_model(
             checkpoint_path=checkpoint_path,
             training=self.training,
-            num_queries=config.max_seg_nums,
+            num_queries=grounding_num_queries,
         )
 
     def get_sam_model(self):

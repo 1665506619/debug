@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
@@ -39,6 +40,25 @@ class VideoSegTrainer(nn.Module):
             frames=frames,
             **kwargs,
         )
+
+    @contextmanager
+    def _single_rank_video_forward(self):
+        """Run the internal SAM3 video stack in per-rank local mode under outer DDP."""
+        sam3_video_model = self.sam3_video_model
+        detector = sam3_video_model.detector
+        orig_rank = sam3_video_model.rank
+        orig_world_size = sam3_video_model.world_size
+        orig_detector_rank = detector.rank
+        orig_detector_world_size = detector.world_size
+        sam3_video_model.rank = detector.rank = 0
+        sam3_video_model.world_size = detector.world_size = 1
+        try:
+            yield
+        finally:
+            sam3_video_model.rank = orig_rank
+            sam3_video_model.world_size = orig_world_size
+            detector.rank = orig_detector_rank
+            detector.world_size = orig_detector_world_size
 
     def _resolve_start_frame(
         self,
@@ -99,24 +119,25 @@ class VideoSegTrainer(nn.Module):
 
         start_frame = self._resolve_start_frame(video_mask_valid, start_frame)
 
-        frame_idx, prompt_out = self.sam3_video_model.add_prompt_for_training(
-            inference_state,
-            frame_idx=start_frame,
-            text_str=phrase,
-        )
+        with self._single_rank_video_forward():
+            frame_idx, prompt_out = self.sam3_video_model.add_prompt_for_training(
+                inference_state,
+                frame_idx=start_frame,
+                text_str=phrase,
+            )
 
-        num_frames = inference_state["num_frames"]
-        frame_outputs: List[Optional[Dict[str, Any]]] = [None] * num_frames
-        frame_outputs[frame_idx] = prompt_out
+            num_frames = inference_state["num_frames"]
+            frame_outputs: List[Optional[Dict[str, Any]]] = [None] * num_frames
+            frame_outputs[frame_idx] = prompt_out
 
-        for out_frame_idx, out in self.sam3_video_model.propagate_in_video_for_training(
-            inference_state,
-            start_frame_idx=start_frame,
-            max_frame_num_to_track=max_frame_num_to_track,
-            reverse=False,
-            include_start_frame=False,
-        ):
-            frame_outputs[out_frame_idx] = out
+            for out_frame_idx, out in self.sam3_video_model.propagate_in_video_for_training(
+                inference_state,
+                start_frame_idx=start_frame,
+                max_frame_num_to_track=max_frame_num_to_track,
+                reverse=False,
+                include_start_frame=False,
+            ):
+                frame_outputs[out_frame_idx] = out
 
         return {
             "phrase": phrase,

@@ -1,3 +1,5 @@
+import json
+import os
 import pathlib
 import warnings
 import torch
@@ -38,6 +40,39 @@ from easy_vlm.models import (
 from easy_vlm.constants import (REGION_TOKEN, SEG_TOKEN, REF_START_TOKEN, REF_END_TOKEN, SEG_START_TOKEN, SEG_END_TOKEN)
 from .nv import *
 from easy_vlm.models.attention_ import *
+
+
+def _infer_pretrained_grounding_query_count(model_path: str):
+    query_key = "model.grounding_model.model.transformer.decoder.query_embed.weight"
+    if not os.path.isdir(model_path):
+        return None
+
+    shard_path = None
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        shard_name = index_data.get("weight_map", {}).get(query_key)
+        if shard_name is None:
+            return None
+        shard_path = os.path.join(model_path, shard_name)
+    else:
+        single_path = os.path.join(model_path, "model.safetensors")
+        if os.path.isfile(single_path):
+            shard_path = single_path
+
+    if shard_path is None or not os.path.isfile(shard_path):
+        return None
+
+    from safetensors import safe_open
+
+    with safe_open(shard_path, framework="pt", device="cpu") as f:
+        if query_key not in f.keys():
+            return None
+        shape = f.get_slice(query_key).get_shape()
+    if len(shape) != 2:
+        return None
+    return int(shape[0])
 
 def set_seed(seed=42):
     """
@@ -129,6 +164,17 @@ def build_model(args: TrainingArguments):
 
 
     original_config.max_seg_nums = args.max_seg_nums
+    pretrained_grounding_queries = _infer_pretrained_grounding_query_count(
+        args.model_path
+    )
+    original_config.grounding_num_queries = max(
+        args.max_seg_nums,
+        pretrained_grounding_queries or 0,
+    )
+    rank0_print(
+        f"seg query setup: data/query groups use max_seg_nums={args.max_seg_nums}, "
+        f"grounding model uses grounding_num_queries={original_config.grounding_num_queries}"
+    )
     original_config.seg_encoder = args.seg_encoder
     original_config.seg_decoder = args.seg_decoder
     original_config.mask_decoder_model = args.mask_decoder_model
