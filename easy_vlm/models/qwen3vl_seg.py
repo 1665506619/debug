@@ -58,6 +58,7 @@ class Qwen3VLSegCausalLMOutputWithPast(ModelOutput):
     mask_dice_loss: Optional[torch.FloatTensor] = None
     mask_loss: Optional[torch.FloatTensor] = None
     cls_loss: Optional[torch.FloatTensor] = None
+    selection_loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     past_key_values: Optional[Cache] = None
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
@@ -348,6 +349,9 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             ce_loss_weight=config.bce_loss_weight,
             cls_loss_weight=config.cls_loss_weight,
         )
+        self.video_selection_query_proj = nn.Linear(config.out_dim, config.out_dim)
+        self.video_selection_obj_proj = nn.Linear(config.out_dim, config.out_dim)
+        self.video_selection_loss_weight = getattr(config, "video_selection_loss_weight", 0.5)
         self._video_spike_log_count = 0
         self._video_spike_log_limit = 20
         self._reset_generation_state()
@@ -488,6 +492,67 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             "num_cls": 1 if cls_sum is not None else 0,
         }
 
+    def _compute_video_selection_logits(
+        self,
+        query_embeddings: torch.Tensor,
+        candidate_query_feats: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if (
+            query_embeddings is None
+            or candidate_query_feats is None
+            or candidate_query_feats.numel() == 0
+        ):
+            return None
+        if candidate_query_feats.dim() != 2 or candidate_query_feats.shape[-1] == 0:
+            return None
+
+        selector_dtype = next(self.video_selection_query_proj.parameters()).dtype
+        query_summary = query_embeddings.mean(dim=0, keepdim=True).to(selector_dtype)
+        candidate_query_feats = candidate_query_feats.to(selector_dtype)
+        projected_query = self.video_selection_query_proj(query_summary)
+        projected_candidates = self.video_selection_obj_proj(candidate_query_feats)
+        selection_logits = (
+            projected_candidates * projected_query
+        ).sum(dim=-1) / math.sqrt(projected_candidates.shape[-1])
+        return selection_logits.to(query_embeddings.dtype)
+
+    def _compute_video_selection_loss(
+        self,
+        query_embeddings: torch.Tensor,
+        frame_out: Dict[str, torch.Tensor],
+        gt_masks_cur: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        candidate_query_feats = frame_out.get("candidate_query_feats", None)
+        selection_logits = self._compute_video_selection_logits(
+            query_embeddings,
+            candidate_query_feats,
+        )
+        if selection_logits is None:
+            return None, None
+
+        pred_masks_cur = frame_out.get("pred_mask_logits", None)
+        if pred_masks_cur is None or pred_masks_cur.numel() == 0:
+            return selection_logits, None
+
+        with torch.no_grad():
+            union_gt_mask = gt_masks_cur.any(dim=0).to(pred_masks_cur.dtype)
+            selection_targets = []
+            for pred_mask in pred_masks_cur:
+                q_score = dice_score(pred_mask.sigmoid(), union_gt_mask)
+                selection_targets.append(max(q_score.item(), 0.0))
+            selection_targets = torch.tensor(
+                selection_targets,
+                device=selection_logits.device,
+                dtype=selection_logits.dtype,
+            )
+
+        selection_loss = F.binary_cross_entropy_with_logits(
+            selection_logits,
+            selection_targets,
+            reduction="mean",
+        )
+        return selection_logits, selection_loss
+
     def _compute_video_sample_losses(
         self,
         pred_embeddings: torch.Tensor,
@@ -521,6 +586,8 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             "max_group_idx": None,
             "start_frame": None,
             "num_supervised_frames": 0,
+            "selection_sum": None,
+            "selection_count": 0,
         }
 
         if (
@@ -589,6 +656,20 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
                 pred_masks_cur = frame_out["pred_mask_logits"]
                 pred_score_logits_cur = frame_out["out_score_logits"]
+                if frame_idx == start_frame:
+                    selection_logits, selection_loss = self._compute_video_selection_loss(
+                        pred_embeddings[group_idx],
+                        frame_out,
+                        gt_masks_cur,
+                    )
+                    if selection_logits is not None:
+                        pred_score_logits_cur = pred_score_logits_cur + selection_logits
+                    if selection_loss is not None:
+                        if result["selection_sum"] is None:
+                            result["selection_sum"] = selection_loss
+                        else:
+                            result["selection_sum"] = result["selection_sum"] + selection_loss
+                        result["selection_count"] += 1
                 if pred_masks_cur is None or pred_masks_cur.shape[0] == 0:
                     continue
 
@@ -791,6 +872,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         mask_dice_loss = None
         mask_loss = None
         cls_loss = None
+        selection_loss = None
 
         if labels is not None: # training
             ce_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
@@ -810,6 +892,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 cls_sum = None
                 num_masks = 0
                 num_cls = 0
+                num_selection = 0
                 for i in range(bs):
                     input_id = input_ids[i]
                     seg_token_mask = input_id==self.config.seg_token_index
@@ -877,6 +960,12 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                                     cls_sum = cls_sum + sample_video_losses[cls_key]
                             num_masks += sample_video_losses[f"{prefix}_num_masks"]
                             num_cls += sample_video_losses[f"{prefix}_num_cls"]
+                        if sample_video_losses["selection_sum"] is not None:
+                            if selection_loss is None:
+                                selection_loss = sample_video_losses["selection_sum"]
+                            else:
+                                selection_loss = selection_loss + sample_video_losses["selection_sum"]
+                            num_selection += sample_video_losses["selection_count"]
 
                         if (
                             sample_video_losses["max_frame_mask_bce"] is not None
@@ -976,12 +1065,17 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     cls_loss = cls_sum / num_cls
                 else:
                     cls_loss = ce_loss*0.0
+                if selection_loss is not None:
+                    selection_loss = selection_loss / max(num_selection, 1)
+                else:
+                    selection_loss = ce_loss * 0.0
                 
                 mask_bce_loss = self.config.bce_loss_weight * mask_bce_loss 
                 mask_dice_loss = self.config.dice_loss_weight * mask_dice_loss 
                 cls_loss = self.config.cls_loss_weight * cls_loss
+                selection_loss = self.video_selection_loss_weight * selection_loss
                 mask_loss = mask_bce_loss + mask_dice_loss
-                loss = mask_loss + ce_loss + cls_loss
+                loss = mask_loss + ce_loss + cls_loss + selection_loss
     
             if not batch_has_valid_mask_supervision:
                 # print('No valid masks found.')
@@ -990,6 +1084,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 mask_dice_loss = loss * 0.0
                 mask_loss = loss * 0.0
                 cls_loss = loss * 0.0
+                selection_loss = loss * 0.0
 
 
         if mask_loss is not None: # training
@@ -1000,6 +1095,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 mask_dice_loss=mask_dice_loss.detach(),
                 mask_loss=mask_loss.detach(),
                 cls_loss=cls_loss.detach(),
+                selection_loss=selection_loss.detach(),
                 logits=logits,
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
