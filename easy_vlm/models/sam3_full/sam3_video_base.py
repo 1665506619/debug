@@ -164,6 +164,7 @@ class Sam3VideoBase(nn.Module):
         is_image_only: bool = False,
         allow_new_detections: bool = True,
         external_query_embed=None,
+        return_raw_outputs: bool = False,
     ):
         """
         This function handles one-step inference for the DenseTracking model in an SPMD manner.
@@ -253,6 +254,7 @@ class Sam3VideoBase(nn.Module):
 
         # Step 5: finally, build the outputs for this frame (it only needs to be done on GPU 0 since
         # only GPU 0 will send outputs to the server).
+        raw_frame_outputs = None
         if self.rank == 0:
             obj_id_to_mask = self.build_outputs(
                 frame_idx=frame_idx,
@@ -268,6 +270,18 @@ class Sam3VideoBase(nn.Module):
                 reconditioned_obj_ids=reconditioned_obj_ids,
                 det_to_matched_trk_obj_ids=det_to_matched_trk_obj_ids,
             )
+            if return_raw_outputs:
+                raw_frame_outputs = self.build_training_outputs(
+                    frame_idx=frame_idx,
+                    det_out=det_out,
+                    tracker_low_res_masks_global=tracker_low_res_masks_global,
+                    tracker_obj_scores_global=tracker_obj_scores_global,
+                    tracker_metadata_prev=tracker_metadata_prev,
+                    tracker_update_plan=tracker_update_plan,
+                    orig_vid_height=orig_vid_height,
+                    orig_vid_width=orig_vid_width,
+                    reconditioned_obj_ids=reconditioned_obj_ids,
+                )
             obj_id_to_score = tracker_metadata_new["obj_id_to_score"]
         else:
             obj_id_to_mask, obj_id_to_score = {}, {}  # dummy outputs on other GPUs
@@ -284,7 +298,7 @@ class Sam3VideoBase(nn.Module):
             tracker_metadata_new["obj_id_to_tracker_score_frame_wise"][
                 frame_idx
             ].update(dict(zip(tracker_obj_ids, tracker_obj_scores_global)))
-        return (
+        outputs = (
             obj_id_to_mask,  # a dict: obj_id --> output mask
             obj_id_to_score,  # a dict: obj_id --> output score (prob)
             tracker_states_local_new,
@@ -292,6 +306,9 @@ class Sam3VideoBase(nn.Module):
             frame_stats,
             tracker_obj_scores_global,  # a dict: obj_id --> tracker frame-level scores
         )
+        if return_raw_outputs:
+            return outputs + (raw_frame_outputs,)
+        return outputs
 
     def _suppress_detections_close_to_boundary(self, boxes, margin=0.025):
         """
@@ -537,7 +554,9 @@ class Sam3VideoBase(nn.Module):
 
         # Step 1: make the update plan and resolve heuristics on GPU 0
         det_mask_preds: Tensor = det_out["mask"]  # low-res mask logits
-        det_scores_np: npt.NDArray = det_out["scores"].float().cpu().numpy()
+        det_scores_np: npt.NDArray = (
+            det_out["scores"].detach().float().cpu().numpy()
+        )
         det_bbox_xyxy: Tensor = det_out["bbox"]
         if self.rank == 0:
             # a) match detector and tracker masks and find new objects
@@ -557,7 +576,7 @@ class Sam3VideoBase(nn.Module):
                 keep = self._suppress_detections_close_to_boundary(
                     det_bbox_xyxy[new_det_fa_inds]
                 )
-                new_det_fa_inds = new_det_fa_inds[keep.cpu().numpy()]
+                new_det_fa_inds = new_det_fa_inds[keep.detach().cpu().numpy()]
 
             # check whether we've hit the maximum number of objects we can track (and if so, drop some detections)
             prev_obj_num = np.sum(tracker_metadata_prev["num_obj_per_gpu"])
@@ -1017,6 +1036,115 @@ class Sam3VideoBase(nn.Module):
 
         return obj_id_to_mask
 
+    def build_training_outputs(
+        self,
+        frame_idx: int,
+        det_out: Dict[str, Tensor],
+        tracker_low_res_masks_global: Tensor,
+        tracker_obj_scores_global: Tensor,
+        tracker_metadata_prev: Dict[str, npt.NDArray],
+        tracker_update_plan: Dict[str, npt.NDArray],
+        orig_vid_height: int,
+        orig_vid_width: int,
+        reconditioned_obj_ids: set = None,
+    ):
+        new_det_fa_inds: npt.NDArray = tracker_update_plan["new_det_fa_inds"]
+        new_det_obj_ids: npt.NDArray = tracker_update_plan["new_det_obj_ids"]
+
+        device = tracker_low_res_masks_global.device
+        if device.type == "cpu" and det_out["mask"].numel() > 0:
+            device = det_out["mask"].device
+
+        obj_ids = []
+        mask_logits = []
+        score_probs = []
+
+        existing_masklet_obj_ids = tracker_metadata_prev["obj_ids_all_gpu"]
+        if tracker_low_res_masks_global.shape[0] > 0:
+            existing_masklet_video_res_masks = F.interpolate(
+                tracker_low_res_masks_global.unsqueeze(1),
+                size=(orig_vid_height, orig_vid_width),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+            existing_scores = tracker_obj_scores_global.sigmoid()
+
+            obj_ids.extend(existing_masklet_obj_ids.tolist())
+            mask_logits.append(existing_masklet_video_res_masks)
+            score_probs.append(existing_scores)
+
+        if len(new_det_obj_ids) > 0:
+            new_det_fa_inds_t = torch.as_tensor(
+                new_det_fa_inds,
+                device=det_out["mask"].device,
+                dtype=torch.long,
+            )
+            new_det_low_res_masks = det_out["mask"][new_det_fa_inds_t].unsqueeze(1)
+            new_det_low_res_masks = fill_holes_in_mask_scores(
+                new_det_low_res_masks,
+                max_area=self.fill_hole_area,
+                fill_holes=True,
+                remove_sprinkles=True,
+            )
+            new_masklet_video_res_masks = F.interpolate(
+                new_det_low_res_masks,
+                size=(orig_vid_height, orig_vid_width),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+            new_det_scores = det_out["scores"][new_det_fa_inds_t]
+
+            obj_ids.extend(new_det_obj_ids.tolist())
+            mask_logits.append(new_masklet_video_res_masks)
+            score_probs.append(new_det_scores)
+
+        if len(obj_ids) == 0:
+            empty_masks = torch.zeros(
+                0,
+                orig_vid_height,
+                orig_vid_width,
+                device=device,
+                dtype=det_out["mask"].dtype,
+            )
+            empty_scores = torch.zeros(0, device=device, dtype=det_out["scores"].dtype)
+            empty_ids = torch.zeros(0, device=device, dtype=torch.long)
+            return {
+                "frame_idx": frame_idx,
+                "out_obj_ids": empty_ids,
+                "pred_mask_logits": empty_masks,
+                "out_probs": empty_scores,
+            }
+
+        pred_mask_logits = torch.cat(mask_logits, dim=0)
+        out_probs = torch.cat(score_probs, dim=0)
+        out_obj_ids = torch.tensor(obj_ids, dtype=torch.long, device=pred_mask_logits.device)
+
+        if reconditioned_obj_ids:
+            trk_id_to_max_iou_high_conf_det = tracker_update_plan.get(
+                "trk_id_to_max_iou_high_conf_det", {}
+            )
+            obj_id_to_index = {obj_id: idx for idx, obj_id in enumerate(obj_ids)}
+            for obj_id in reconditioned_obj_ids:
+                det_idx = trk_id_to_max_iou_high_conf_det.get(obj_id)
+                out_idx = obj_id_to_index.get(obj_id)
+                if det_idx is None or out_idx is None:
+                    continue
+                det_mask = det_out["mask"][det_idx : det_idx + 1].unsqueeze(1)
+                det_mask = F.interpolate(
+                    det_mask,
+                    size=(orig_vid_height, orig_vid_width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+                pred_mask_logits[out_idx : out_idx + 1] = det_mask
+
+        return {
+            "frame_idx": frame_idx,
+            "out_obj_ids": out_obj_ids,
+            "pred_mask_logits": pred_mask_logits,
+            "out_probs": out_probs,
+        }
+
     def _get_objects_to_suppress_based_on_most_recently_occluded(
         self,
         binary_low_res_masks: Tensor,
@@ -1074,9 +1202,9 @@ class Sam3VideoBase(nn.Module):
             and logger.isEnabledFor(logging.DEBUG)
             and frame_idx is not None
         ):
-            suppress_i_mask = suppress_i_mask.cpu().numpy()
-            suppress_j_mask = suppress_j_mask.cpu().numpy()
-            last_occluded = last_occluded.cpu().numpy()
+            suppress_i_mask = suppress_i_mask.detach().cpu().numpy()
+            suppress_j_mask = suppress_j_mask.detach().cpu().numpy()
+            last_occluded = last_occluded.detach().cpu().numpy()
 
             # Find all suppression pairs without using torch.where
             batch_size = suppress_i_mask.shape[0]
@@ -1212,7 +1340,9 @@ class Sam3VideoBase(nn.Module):
         elif det_masks.size(0) == 0:
             # all previous tracklets are unmatched if they have a non-zero area
             new_det_fa_inds = np.array([], np.int64)
-            trk_is_nonempty = (trk_masks > 0).any(dim=(1, 2)).cpu().numpy()
+            trk_is_nonempty = (
+                (trk_masks > 0).any(dim=(1, 2)).detach().cpu().numpy()
+            )
             unmatched_trk_obj_ids = trk_obj_ids[trk_is_nonempty]
             empty_trk_obj_ids = trk_obj_ids[~trk_is_nonempty]
             det_to_matched_trk_obj_ids = {}
@@ -1247,7 +1377,7 @@ class Sam3VideoBase(nn.Module):
         trk_masks_binary = trk_masks > 0
         ious = mask_iou(det_masks_binary, trk_masks_binary)  # (N, M)
 
-        ious_np = ious.cpu().numpy()
+        ious_np = ious.detach().cpu().numpy()
         if self.o2o_matching_masklets_enable:
             from scipy.optimize import linear_sum_assignment
 
@@ -1261,7 +1391,9 @@ class Sam3VideoBase(nn.Module):
         else:
             trk_is_matched = (ious_np >= iou_threshold_trk).any(axis=0)
         # Non-empty tracks not matched by Hungarian assignment above threshold are unmatched
-        trk_is_nonempty = trk_masks_binary.any(dim=(1, 2)).cpu().numpy()
+        trk_is_nonempty = (
+            trk_masks_binary.any(dim=(1, 2)).detach().cpu().numpy()
+        )
         trk_is_unmatched = np.logical_and(trk_is_nonempty, ~trk_is_matched)
         unmatched_trk_obj_ids = trk_obj_ids[trk_is_unmatched]
         # also record masklets that have zero area in SAM 2 prediction

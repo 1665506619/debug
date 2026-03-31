@@ -17,12 +17,13 @@ from sam3.model.data_misc import BatchedDatapoint, convert_my_tensors, FindStage
 from sam3.model.geometry_encoders import Prompt
 from sam3.model.io_utils import IMAGE_EXTS, load_resource_as_video_frames
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
-from sam3.model.sam3_video_base import MaskletConfirmationStatus, Sam3VideoBase
 from sam3.model.utils.misc import copy_data_to_device
 from sam3.perflib.compile import compile_wrapper, shape_logging_wrapper
 from sam3.perflib.masks_ops import masks_to_boxes as perf_masks_to_boxes
 from torchvision.ops import masks_to_boxes
 from tqdm.auto import tqdm
+
+from .sam3_video_base import MaskletConfirmationStatus, Sam3VideoBase
 
 logger = get_logger(__name__)
 
@@ -51,15 +52,21 @@ class Sam3VideoInference(Sam3VideoBase):
         self.image_std = image_std
         self.compile_model = compile_model
 
-    @torch.inference_mode()
-    def init_state(
+    def _init_state_impl(
         self,
-        resource_path,
+        resource_path=None,
+        frames=None,
         offload_video_to_cpu=False,
         async_loading_frames=False,
         video_loader_type="cv2",
     ):
-        """Initialize an inference state from `resource_path` (an image or a video)."""
+        if frames is not None:
+            if len(frames) == 0:
+                raise ValueError("frames must contain at least one frame")
+            resource_path = list(frames)
+        elif resource_path is None:
+            raise ValueError("resource_path or frames must be provided")
+
         images, orig_height, orig_width = load_resource_as_video_frames(
             resource_path=resource_path,
             image_size=self.image_size,
@@ -69,33 +76,64 @@ class Sam3VideoInference(Sam3VideoBase):
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
         )
+        if frames is not None:
+            is_image_only = len(frames) == 1
+        else:
+            is_image_only = is_image_type(resource_path)
+
         inference_state = {}
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
-        # the original video height and width, used for resizing final output scores
         inference_state["orig_height"] = orig_height
         inference_state["orig_width"] = orig_width
-        # values that don't change across frames (so we only need to hold one copy of them)
         inference_state["constants"] = {}
-        # inputs on each frame
         self._construct_initial_input_batch(inference_state, images)
-        # initialize extra states
         inference_state["tracker_inference_states"] = []
         inference_state["tracker_metadata"] = {}
         inference_state["feature_cache"] = {}
         inference_state["cached_frame_outputs"] = {}
-        inference_state["action_history"] = []  # for logging user actions
-        inference_state["is_image_only"] = is_image_type(resource_path)
+        inference_state["action_history"] = []
+        inference_state["is_image_only"] = is_image_only
         return inference_state
 
     @torch.inference_mode()
-    def reset_state(self, inference_state):
+    def init_state(
+        self,
+        resource_path,
+        offload_video_to_cpu=False,
+        async_loading_frames=False,
+        video_loader_type="cv2",
+    ):
+        """Initialize an inference state from `resource_path` (an image or a video)."""
+        return self._init_state_impl(
+            resource_path=resource_path,
+            offload_video_to_cpu=offload_video_to_cpu,
+            async_loading_frames=async_loading_frames,
+            video_loader_type=video_loader_type,
+        )
+
+    def init_state_for_training(
+        self,
+        resource_path=None,
+        frames=None,
+        offload_video_to_cpu=False,
+        async_loading_frames=False,
+        video_loader_type="cv2",
+    ):
+        return self._init_state_impl(
+            resource_path=resource_path,
+            frames=frames,
+            offload_video_to_cpu=offload_video_to_cpu,
+            async_loading_frames=async_loading_frames,
+            video_loader_type=video_loader_type,
+        )
+
+    def _reset_state_impl(self, inference_state):
         """Revert `inference_state` to what it was right after initialization."""
         inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
         inference_state["text_prompt"] = None
         for t in range(inference_state["num_frames"]):
             inference_state["input_batch"].find_inputs[t].text_ids[...] = 0
-            # constructing an output list in inference state (we start with an empty list)
             inference_state["previous_stages_out"][t] = None
             inference_state["per_frame_raw_point_input"][t] = None
             inference_state["per_frame_raw_box_input"][t] = None
@@ -109,7 +147,11 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["tracker_metadata"].clear()
         inference_state["feature_cache"].clear()
         inference_state["cached_frame_outputs"].clear()
-        inference_state["action_history"].clear()  # for logging user actions
+        inference_state["action_history"].clear()
+
+    @torch.inference_mode()
+    def reset_state(self, inference_state):
+        self._reset_state_impl(inference_state)
 
     def _construct_initial_input_batch(self, inference_state, images):
         """Construct an initial `BatchedDatapoint` instance as input."""
@@ -431,6 +473,151 @@ class Sam3VideoInference(Sam3VideoBase):
                 out["unconfirmed_obj_ids"] = []
 
         return out
+
+    def _run_single_frame_training(self, inference_state, frame_idx, reverse):
+        input_batch = inference_state["input_batch"]
+        tracker_states_local = inference_state["tracker_inference_states"]
+        has_text_prompt = inference_state["text_prompt"] is not None
+        has_geometric_prompt = (
+            inference_state["per_frame_geometric_prompt"][frame_idx] is not None
+        )
+        external_query_embed = inference_state["constants"].get(
+            "external_query_embed", None
+        )
+        (
+            _,
+            _,
+            tracker_states_local_new,
+            tracker_metadata_new,
+            frame_stats,
+            _,
+            raw_frame_out,
+        ) = self._det_track_one_frame(
+            frame_idx=frame_idx,
+            num_frames=inference_state["num_frames"],
+            reverse=reverse,
+            input_batch=input_batch,
+            geometric_prompt=(
+                inference_state["constants"]["empty_geometric_prompt"]
+                if not has_geometric_prompt
+                else inference_state["per_frame_geometric_prompt"][frame_idx]
+            ),
+            tracker_states_local=tracker_states_local,
+            tracker_metadata_prev=inference_state["tracker_metadata"],
+            feature_cache=inference_state["feature_cache"],
+            orig_vid_height=inference_state["orig_height"],
+            orig_vid_width=inference_state["orig_width"],
+            is_image_only=inference_state["is_image_only"],
+            allow_new_detections=has_text_prompt or has_geometric_prompt,
+            external_query_embed=external_query_embed,
+            return_raw_outputs=True,
+        )
+        inference_state["tracker_inference_states"] = tracker_states_local_new
+        inference_state["tracker_metadata"] = tracker_metadata_new
+        inference_state["previous_stages_out"][frame_idx] = "_THIS_FRAME_HAS_OUTPUTS_"
+        raw_frame_out["frame_stats"] = frame_stats
+        return raw_frame_out
+
+    def _prepare_prompt_state(
+        self,
+        inference_state,
+        frame_idx,
+        text_str=None,
+        boxes_xywh=None,
+        box_labels=None,
+    ):
+        logger.debug("Running add_prompt on frame %d", frame_idx)
+
+        num_frames = inference_state["num_frames"]
+        assert text_str is not None or boxes_xywh is not None, (
+            "at least one type of prompt (text, boxes) must be provided"
+        )
+        assert 0 <= frame_idx < num_frames, (
+            f"{frame_idx=} is out of range for a total of {num_frames} frames"
+        )
+
+        self._reset_state_impl(inference_state)
+
+        if text_str is not None and text_str != "visual":
+            inference_state["text_prompt"] = text_str
+            inference_state["input_batch"].find_text_batch[0] = text_str
+            text_id = self.TEXT_ID_FOR_TEXT
+        else:
+            inference_state["text_prompt"] = None
+            inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
+            text_id = self.TEXT_ID_FOR_VISUAL
+        for t in range(inference_state["num_frames"]):
+            inference_state["input_batch"].find_inputs[t].text_ids[...] = text_id
+
+        assert (boxes_xywh is not None) == (box_labels is not None)
+        if boxes_xywh is not None:
+            boxes_xywh = torch.as_tensor(boxes_xywh, dtype=torch.float32)
+            box_labels = torch.as_tensor(box_labels, dtype=torch.long)
+            assert boxes_xywh.dim() == 2
+            assert boxes_xywh.size(0) > 0 and boxes_xywh.size(-1) == 4
+            assert box_labels.dim() == 1 and box_labels.size(0) == boxes_xywh.size(0)
+            boxes_cxcywh = box_xywh_to_cxcywh(boxes_xywh)
+            assert (boxes_xywh >= 0).all().item() and (boxes_xywh <= 1).all().item()
+            assert (boxes_cxcywh >= 0).all().item() and (boxes_cxcywh <= 1).all().item()
+
+            new_box_input = boxes_cxcywh, box_labels
+            inference_state["per_frame_raw_box_input"][frame_idx] = new_box_input
+
+            boxes_cxcywh, box_labels, geometric_prompt = self._get_visual_prompt(
+                inference_state, frame_idx, boxes_cxcywh, box_labels
+            )
+
+            inference_state["per_frame_geometric_prompt"][frame_idx] = geometric_prompt
+
+    def add_prompt_for_training(
+        self,
+        inference_state,
+        frame_idx,
+        text_str=None,
+        boxes_xywh=None,
+        box_labels=None,
+    ):
+        self._prepare_prompt_state(
+            inference_state,
+            frame_idx=frame_idx,
+            text_str=text_str,
+            boxes_xywh=boxes_xywh,
+            box_labels=box_labels,
+        )
+        out = self._run_single_frame_training(
+            inference_state, frame_idx, reverse=False
+        )
+        return frame_idx, out
+
+    def propagate_in_video_for_training(
+        self,
+        inference_state,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+        include_start_frame=False,
+    ):
+        self._compile_model()
+
+        processing_order, _ = self._get_processing_order(
+            inference_state,
+            start_frame_idx,
+            max_frame_num_to_track,
+            reverse=reverse,
+        )
+
+        inference_state["feature_cache"]["tracking_bounds"] = {
+            "max_frame_num_to_track": max_frame_num_to_track,
+            "propagate_in_video_start_frame_idx": start_frame_idx,
+        }
+
+        for frame_idx in tqdm(
+            processing_order, desc="propagate_in_video_train", disable=self.rank > 0
+        ):
+            if frame_idx == start_frame_idx and not include_start_frame:
+                continue
+            out = self._run_single_frame_training(inference_state, frame_idx, reverse)
+            yield frame_idx, out
 
     def _postprocess_output(
         self,
@@ -857,54 +1044,13 @@ class Sam3VideoInference(Sam3VideoBase):
         Note that text prompts are NOT associated with a particular frame (i.e. they apply
         to all frames). However, we only run inference on the frame specified in `frame_idx`.
         """
-        logger.debug("Running add_prompt on frame %d", frame_idx)
-
-        num_frames = inference_state["num_frames"]
-        assert text_str is not None or boxes_xywh is not None, (
-            "at least one type of prompt (text, boxes) must be provided"
+        self._prepare_prompt_state(
+            inference_state,
+            frame_idx=frame_idx,
+            text_str=text_str,
+            boxes_xywh=boxes_xywh,
+            box_labels=box_labels,
         )
-        assert 0 <= frame_idx < num_frames, (
-            f"{frame_idx=} is out of range for a total of {num_frames} frames"
-        )
-
-        # since it's a semantic prompt, we start over
-        self.reset_state(inference_state)
-
-        # 1) add text prompt
-        if text_str is not None and text_str != "visual":
-            inference_state["text_prompt"] = text_str
-            inference_state["input_batch"].find_text_batch[0] = text_str
-            text_id = self.TEXT_ID_FOR_TEXT
-        else:
-            inference_state["text_prompt"] = None
-            inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
-            text_id = self.TEXT_ID_FOR_VISUAL
-        for t in range(inference_state["num_frames"]):
-            inference_state["input_batch"].find_inputs[t].text_ids[...] = text_id
-
-        # 2) handle box prompt
-        assert (boxes_xywh is not None) == (box_labels is not None)
-        if boxes_xywh is not None:
-            boxes_xywh = torch.as_tensor(boxes_xywh, dtype=torch.float32)
-            box_labels = torch.as_tensor(box_labels, dtype=torch.long)
-            # input boxes are expected to be [xmin, ymin, width, height] format
-            # in normalized coordinates of range 0~1, similar to FA
-            assert boxes_xywh.dim() == 2
-            assert boxes_xywh.size(0) > 0 and boxes_xywh.size(-1) == 4
-            assert box_labels.dim() == 1 and box_labels.size(0) == boxes_xywh.size(0)
-            boxes_cxcywh = box_xywh_to_cxcywh(boxes_xywh)
-            assert (boxes_xywh >= 0).all().item() and (boxes_xywh <= 1).all().item()
-            assert (boxes_cxcywh >= 0).all().item() and (boxes_cxcywh <= 1).all().item()
-
-            new_box_input = boxes_cxcywh, box_labels
-            inference_state["per_frame_raw_box_input"][frame_idx] = new_box_input
-
-            # handle the case of visual prompt (also added as an input box from the UI)
-            boxes_cxcywh, box_labels, geometric_prompt = self._get_visual_prompt(
-                inference_state, frame_idx, boxes_cxcywh, box_labels
-            )
-
-            inference_state["per_frame_geometric_prompt"][frame_idx] = geometric_prompt
 
         out = self._run_single_frame_inference(
             inference_state, frame_idx, reverse=False

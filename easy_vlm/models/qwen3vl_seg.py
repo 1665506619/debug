@@ -1,6 +1,7 @@
 import math
 import inspect
 import os
+import warnings
 from collections import defaultdict
 from typing import List, Optional, Tuple, Union, Dict, Any
 from dataclasses import dataclass
@@ -325,6 +326,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
         self.video_seg_engine = None
+        self.video_propagation_trainer = None
 
         self.loss_mask = CrossEntropyLoss(
             use_sigmoid=True,
@@ -352,6 +354,232 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
     def set_video_seg_engine(self, video_seg_engine):
         self.video_seg_engine = video_seg_engine
+
+    def initialize_video_propagation_trainer(self, force: bool = False):
+        if self.video_propagation_trainer is not None and not force:
+            return self.video_propagation_trainer
+
+        from .video_seg_trainer import build_video_seg_trainer
+
+        shared_detector = self.model.grounding_model.get_sam_model()
+        self.video_propagation_trainer = build_video_seg_trainer(
+            self.config,
+            shared_detector=shared_detector,
+        )
+        return self.video_propagation_trainer
+
+    def _compute_assigned_mask_losses(
+        self,
+        pred_masks: torch.Tensor,
+        pred_scores: torch.Tensor,
+        gt_masks: torch.Tensor,
+        mask_type_value: int,
+    ):
+        if gt_masks.numel() == 0 or pred_masks.numel() == 0 or pred_scores.numel() == 0:
+            return {
+                "mask_bce_sum": None,
+                "mask_dice_sum": None,
+                "cls_sum": None,
+                "num_masks": 0,
+                "num_cls": 0,
+            }
+
+        assign_id = self.assigner.assign(
+            pred_masks.float(),
+            gt_masks.float(),
+            pred_scores.float(),
+        )
+
+        mask_bce_sum = None
+        mask_dice_sum = None
+        cls_sum = None
+        num_masks = 0
+
+        score_targets = torch.zeros_like(pred_scores)
+        for pred_idx, assigned_gt_idx in enumerate(assign_id):
+            if assigned_gt_idx == -1:
+                continue
+
+            gt_masks_cur = gt_masks[assigned_gt_idx : assigned_gt_idx + 1]
+            pred_masks_cur = pred_masks[pred_idx : pred_idx + 1]
+
+            if mask_type_value == 0:
+                if self.config.loss_sample_points:
+                    sampled_pred_mask, sampled_gt_mask = sample_points(
+                        pred_masks_cur, gt_masks_cur
+                    )
+                    bce = self.loss_mask(sampled_pred_mask, sampled_gt_mask)
+                    dice = self.loss_dice(sampled_pred_mask, sampled_gt_mask)
+                else:
+                    bce = self.loss_mask(pred_masks_cur, gt_masks_cur)
+                    dice = self.loss_dice(pred_masks_cur, gt_masks_cur)
+            elif mask_type_value == 1:
+                dice = projection_loss(pred_masks_cur, gt_masks_cur)
+                bce = dice * 0.0
+            else:
+                raise NotImplementedError
+
+            if mask_bce_sum is None:
+                mask_bce_sum = bce
+                mask_dice_sum = dice
+            else:
+                mask_bce_sum = mask_bce_sum + bce
+                mask_dice_sum = mask_dice_sum + dice
+            num_masks += 1
+
+            q_score = dice_score(
+                pred_masks[pred_idx].sigmoid(),
+                gt_masks[assigned_gt_idx],
+            )
+            score_targets[pred_idx] = max(q_score.item(), 0.1)
+
+        if pred_scores.numel() > 0:
+            cls_sum = F.binary_cross_entropy(
+                pred_scores.clamp(min=1e-6, max=1 - 1e-6),
+                score_targets,
+                reduction="mean",
+            )
+
+        return {
+            "mask_bce_sum": mask_bce_sum,
+            "mask_dice_sum": mask_dice_sum,
+            "cls_sum": cls_sum,
+            "num_masks": num_masks,
+            "num_cls": 1 if cls_sum is not None else 0,
+        }
+
+    def _compute_video_sample_losses(
+        self,
+        pred_embeddings: torch.Tensor,
+        seg_phrases: List[str],
+        video_sam_frames,
+        video_clip_masks: torch.Tensor,
+        video_clip_mask_valid: torch.Tensor,
+        mask_id_groups,
+        mask_type_value: int,
+    ):
+        if self.video_propagation_trainer is None:
+            raise RuntimeError(
+                "video propagation trainer is not initialized. "
+                "Call initialize_video_propagation_trainer() before video training."
+            )
+
+        result = {
+            "prompt_mask_bce_sum": None,
+            "prompt_mask_dice_sum": None,
+            "prompt_cls_sum": None,
+            "prompt_num_masks": 0,
+            "prompt_num_cls": 0,
+            "prop_mask_bce_sum": None,
+            "prop_mask_dice_sum": None,
+            "prop_cls_sum": None,
+            "prop_num_masks": 0,
+            "prop_num_cls": 0,
+            "has_valid_supervision": False,
+        }
+
+        if (
+            video_sam_frames is None
+            or video_clip_masks is None
+            or video_clip_mask_valid is None
+            or pred_embeddings.numel() == 0
+        ):
+            return result
+
+        video_clip_masks = video_clip_masks.to(device=pred_embeddings.device)
+        video_clip_mask_valid = video_clip_mask_valid.to(
+            device=pred_embeddings.device,
+            dtype=torch.bool,
+        )
+
+        num_groups = min(
+            pred_embeddings.shape[0],
+            len(seg_phrases),
+            len(mask_id_groups),
+        )
+        for group_idx in range(num_groups):
+            group_phrase = seg_phrases[group_idx]
+            group_mask_ids = mask_id_groups[group_idx]
+            if not group_phrase or len(group_mask_ids) == 0:
+                continue
+
+            group_mask_ids = torch.as_tensor(
+                group_mask_ids,
+                device=video_clip_masks.device,
+                dtype=torch.long,
+            )
+            group_video_masks = video_clip_masks[group_mask_ids]
+            group_video_valid = video_clip_mask_valid[group_mask_ids]
+            if not group_video_valid.any():
+                continue
+
+            start_frame = int(
+                torch.nonzero(group_video_valid.any(dim=0), as_tuple=False)[0].item()
+            )
+            video_result = self.video_propagation_trainer.segment_with_phrase_and_queries(
+                phrase=group_phrase,
+                external_query_embed=pred_embeddings[group_idx],
+                frames=video_sam_frames,
+                video_mask_valid=group_video_valid,
+                start_frame=start_frame,
+            )
+
+            supervised_frames = torch.nonzero(
+                group_video_valid.any(dim=0),
+                as_tuple=False,
+            ).flatten()
+            for frame_idx_tensor in supervised_frames:
+                frame_idx = int(frame_idx_tensor.item())
+                frame_out = video_result["frame_outputs"][frame_idx]
+                if frame_out is None:
+                    continue
+
+                gt_valid = group_video_valid[:, frame_idx]
+                gt_masks_cur = group_video_masks[:, frame_idx][gt_valid]
+                if gt_masks_cur.numel() == 0:
+                    continue
+
+                pred_masks_cur = frame_out["pred_mask_logits"]
+                pred_scores_cur = frame_out["out_probs"]
+                if pred_masks_cur is None or pred_masks_cur.shape[0] == 0:
+                    continue
+
+                pred_masks_cur = pred_masks_cur.unsqueeze(1)
+                gt_masks_cur = gt_masks_cur.unsqueeze(1).to(
+                    device=pred_masks_cur.device,
+                    dtype=pred_masks_cur.dtype,
+                )
+                pred_masks_cur, gt_masks_cur = resize_pred_and_gt_for_loss(
+                    pred_masks_cur,
+                    gt_masks_cur,
+                )
+                frame_losses = self._compute_assigned_mask_losses(
+                    pred_masks_cur,
+                    pred_scores_cur,
+                    gt_masks_cur,
+                    mask_type_value,
+                )
+                if (
+                    frame_losses["num_masks"] == 0
+                    and frame_losses["num_cls"] == 0
+                ):
+                    continue
+
+                result["has_valid_supervision"] = True
+                prefix = "prompt" if frame_idx == start_frame else "prop"
+                for key in ["mask_bce_sum", "mask_dice_sum", "cls_sum"]:
+                    value = frame_losses[key]
+                    if value is None:
+                        continue
+                    result_key = f"{prefix}_{key}"
+                    if result[result_key] is None:
+                        result[result_key] = value
+                    else:
+                        result[result_key] = result[result_key] + value
+                result[f"{prefix}_num_masks"] += frame_losses["num_masks"]
+                result[f"{prefix}_num_cls"] += frame_losses["num_cls"]
+
+        return result
 
     def _ensure_generation_state(self):
         if not hasattr(self, "SEG_START"):
@@ -456,6 +684,10 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         masks_valid = None,
         mask_type = None,
         phrase_ids = None,
+        seg_phrases = None,
+        video_sam_frames = None,
+        video_clip_masks = None,
+        video_clip_mask_valid = None,
         data_indices = None,
         modalities = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -502,7 +734,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             # Fallback to CE only when the whole batch has no effective mask
             # supervision at all; one invalid sample must not wipe valid ones.
             batch_has_valid_mask_supervision = False
-            if masks[0] is not None:
+            if any(mask is not None for mask in masks):
                 g_pixel_values = torch.stack(sam_images, dim=0)  # [bs, C, H, W]
                 with torch.no_grad():
                     vision_outputs_batch = self.model.grounding_model.encoder(g_pixel_values)
@@ -514,7 +746,6 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 num_masks = 0
                 num_cls = 0
                 for i in range(bs):
-                    pred_masks = []
                     input_id = input_ids[i]
                     seg_token_mask = input_id==self.config.seg_token_index
 
@@ -543,21 +774,53 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     if not sample_mask_valid:
                         continue
 
+                    obj_num = pred_embedding.shape[0]
+                    if (
+                        sample_modality == "video"
+                        and video_clip_masks is not None
+                        and video_clip_mask_valid is not None
+                        and video_clip_masks[i] is not None
+                        and video_clip_mask_valid[i] is not None
+                    ):
+                        sample_video_losses = self._compute_video_sample_losses(
+                            pred_embeddings=pred_embedding,
+                            seg_phrases=[] if seg_phrases is None else seg_phrases[i],
+                            video_sam_frames=None if video_sam_frames is None else video_sam_frames[i],
+                            video_clip_masks=video_clip_masks[i],
+                            video_clip_mask_valid=video_clip_mask_valid[i],
+                            mask_id_groups=mask_ids[i],
+                            mask_type_value=mask_type[i],
+                        )
+                        if sample_video_losses["has_valid_supervision"]:
+                            batch_has_valid_mask_supervision = True
+
+                        for prefix in ["prompt", "prop"]:
+                            mask_bce_key = f"{prefix}_mask_bce_sum"
+                            mask_dice_key = f"{prefix}_mask_dice_sum"
+                            cls_key = f"{prefix}_cls_sum"
+                            if sample_video_losses[mask_bce_key] is not None:
+                                if mask_bce_sum is None:
+                                    mask_bce_sum = sample_video_losses[mask_bce_key]
+                                    mask_dice_sum = sample_video_losses[mask_dice_key]
+                                else:
+                                    mask_bce_sum = mask_bce_sum + sample_video_losses[mask_bce_key]
+                                    mask_dice_sum = mask_dice_sum + sample_video_losses[mask_dice_key]
+                            if sample_video_losses[cls_key] is not None:
+                                if cls_sum is None:
+                                    cls_sum = sample_video_losses[cls_key]
+                                else:
+                                    cls_sum = cls_sum + sample_video_losses[cls_key]
+                            num_masks += sample_video_losses[f"{prefix}_num_masks"]
+                            num_cls += sample_video_losses[f"{prefix}_num_cls"]
+                        continue
+
                     g_pixel_values = sam_images[i].unsqueeze(0)
 
                     vision_outputs = self.model.grounding_model.select_vision_outputs(
                         vision_outputs_batch, i
                     )
 
-                    obj_num = pred_embedding.shape[0]
-
                     max_chunk = 5
-                    # print('obj_num:', obj_num, 'vision_outputs shape:', vision_outputs['last_hidden_state'].shape)
-
-                    all_mask_outputs = []
-                    pred_masks_list = []
-                    pred_logits_list = []
-
                     phrase_embedding, text_attn_mask = get_phrase_embedding(
                         phrase_id, phrase_embedding, self.config.ref_start_token_index
                     )
@@ -566,91 +829,63 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                         print(data_indices)
                         print('phrase_embedding is empty')
                         continue
-                    else:
-                        for start in range(0, obj_num, max_chunk):
-                            end = min(start + max_chunk, obj_num)
-                            chunk_size = end - start
 
-                            pred_embedding_chunk = pred_embedding[start:end]  # [chunk, max_seg_nums, dim]（按你原实现）
-                            mask_outputs_chunk = self.model.grounding_model.decoder(
-                                vision_outputs,
-                                phrase_embedding[start:end],
-                                text_attn_mask[start:end],
-                                pred_embedding_chunk
+                    for start in range(0, obj_num, max_chunk):
+                        end = min(start + max_chunk, obj_num)
+                        chunk_size = end - start
+
+                        pred_embedding_chunk = pred_embedding[start:end]
+                        mask_outputs_chunk = self.model.grounding_model.decoder(
+                            vision_outputs,
+                            phrase_embedding[start:end],
+                            text_attn_mask[start:end],
+                            pred_embedding_chunk
+                        )
+
+                        pred_masks_chunk = mask_outputs_chunk["pred_masks"]
+                        pred_logits_chunk = mask_outputs_chunk["pred_logits"]
+                        pred_masks_chunk, gt_mask_rs = resize_pred_and_gt_for_loss(
+                            pred_masks_chunk,
+                            gt_mask,
+                        )
+
+                        for local_midx in range(chunk_size):
+                            global_midx = start + local_midx
+                            mask_id = mask_ids[i][global_midx]
+                            mask_id_tensor = torch.as_tensor(
+                                mask_id,
+                                device=pred_masks_chunk.device,
+                                dtype=torch.long,
                             )
 
-                            pred_masks_chunk = mask_outputs_chunk["pred_masks"]   # [chunk, 50, H, W]
-                            pred_logits_chunk = mask_outputs_chunk["pred_logits"] # [chunk, 50]
+                            pred_masks_cur = pred_masks_chunk[local_midx].unsqueeze(1)
+                            pred_scores_cur = pred_logits_chunk[local_midx]
+                            gt_masks_cur = gt_mask_rs[mask_id_tensor]
 
-                            # resize：只处理当前 chunk（gt_mask 返回的也可直接复用）
-                            pred_masks_chunk, gt_mask_rs = resize_pred_and_gt_for_loss(pred_masks_chunk, gt_mask)
+                            if gt_mask_rs.sum() <= 0:
+                                continue
 
-                            # 对 chunk 内每个对象做 assign + loss
-                            for local_midx in range(chunk_size):
-                                global_midx = start + local_midx  # 对齐你原来的 midx
-
-                                mask_id = mask_ids[i][global_midx]
-                                mask_id_tensor = torch.as_tensor(mask_id, device=pred_masks_chunk.device, dtype=torch.long)
-
-                                # 注意：尽量别 .float()，除非你的 loss 必须 FP32
-                                pred_masks_cur = pred_masks_chunk[local_midx].unsqueeze(1)  # [50, 1, H, W]
-                                pred_scores_cur = pred_logits_chunk[local_midx]             # [50]
-                                gt_masks_cur = gt_mask_rs[mask_id_tensor]                   # [Ng, 1, H, W]
-
-                                if gt_mask_rs.sum()>0: # not null
-                                    batch_has_valid_mask_supervision = True
-
-                                    assign_id = self.assigner.assign(
-                                        pred_masks_cur.float(),
-                                        gt_masks_cur.float(),
-                                        pred_scores_cur.float(),
-                                    )
-
-                                    score_targets = torch.zeros_like(pred_scores_cur)
-                                    for id_, asid in enumerate(assign_id):
-                                        if asid != -1:
-                                            gt_masks_ = gt_masks_cur[asid:asid+1]      # [1,1,H,W]
-                                            pred_masks_ = pred_masks_cur[id_:id_+1]     # [1,1,H,W]
-
-                                            if mask_type[i] == 0:  # mask
-                                                if self.config.loss_sample_points:
-                                                    sampled_pred_mask, sampled_gt_mask = sample_points(pred_masks_, gt_masks_)
-                                                    bce = self.loss_mask(sampled_pred_mask, sampled_gt_mask)
-                                                    dice = self.loss_dice(sampled_pred_mask, sampled_gt_mask)
-                                                else:
-                                                    bce = self.loss_mask(pred_masks_, gt_masks_)
-                                                    dice = self.loss_dice(pred_masks_, gt_masks_)
-                                            elif mask_type[i] == 1:  # bbox
-                                                dice = projection_loss(pred_masks_, gt_masks_)
-                                                bce = dice * 0.0
-                                            else:
-                                                raise NotImplementedError
-
-                                            # bce = bce * _scale
-                                            # dice = dice * _scale
-                                            if mask_bce_sum is None:
-                                                mask_bce_sum = bce
-                                                mask_dice_sum = dice
-                                            else:
-                                                mask_bce_sum = mask_bce_sum + bce
-                                                mask_dice_sum = mask_dice_sum + dice
-                                            num_masks += 1
-
-                                            q_score = dice_score(pred_masks_cur[id_].sigmoid(), gt_masks_cur[asid])
-                                            score_targets[id_] = max(q_score.item(), 0.1)
-                                        else:
-                                            score_targets[id_] = 0.0
-                                else: # null gt
-                                    score_targets = torch.zeros_like(pred_scores_cur)
-
-                                cls_ = F.binary_cross_entropy_with_logits(pred_scores_cur, score_targets, reduction="mean")
-                                if cls_sum is None:
-                                    cls_sum = cls_
+                            batch_has_valid_mask_supervision = True
+                            frame_losses = self._compute_assigned_mask_losses(
+                                pred_masks_cur,
+                                pred_scores_cur.sigmoid(),
+                                gt_masks_cur,
+                                mask_type[i],
+                            )
+                            if frame_losses["mask_bce_sum"] is not None:
+                                if mask_bce_sum is None:
+                                    mask_bce_sum = frame_losses["mask_bce_sum"]
+                                    mask_dice_sum = frame_losses["mask_dice_sum"]
                                 else:
-                                    cls_sum = cls_sum + cls_
-                                num_cls += 1
-
-                            # del mask_outputs_chunk, pred_masks_chunk, pred_logits_chunk, pred_embedding_chunk
+                                    mask_bce_sum = mask_bce_sum + frame_losses["mask_bce_sum"]
+                                    mask_dice_sum = mask_dice_sum + frame_losses["mask_dice_sum"]
+                            if frame_losses["cls_sum"] is not None:
+                                if cls_sum is None:
+                                    cls_sum = frame_losses["cls_sum"]
+                                else:
+                                    cls_sum = cls_sum + frame_losses["cls_sum"]
+                            num_masks += frame_losses["num_masks"]
+                            num_cls += frame_losses["num_cls"]
 
                 if mask_bce_sum is not None:
                     mask_bce_loss = mask_bce_sum / num_masks

@@ -148,6 +148,10 @@ def build_model(args: TrainingArguments):
         low_cpu_mem_usage=False,
     )
 
+    video_propagation_trainer = None
+    if args.mask_decoder_model is not None:
+        video_propagation_trainer = model.initialize_video_propagation_trainer()
+
 
     if args.lora_enable:
         from peft import LoraConfig, get_peft_model
@@ -203,6 +207,9 @@ def build_model(args: TrainingArguments):
         with torch.no_grad():
             model.get_model().video_query_alpha.zero_()
 
+    if video_propagation_trainer is not None and (args.bf16 or args.fp16):
+        video_propagation_trainer.float()
+
     # for p in model.get_model().parameters():
     #     p.requires_grad = True
 
@@ -227,9 +234,15 @@ def build_model(args: TrainingArguments):
     if args.sam_decoder_lr is None or args.sam_decoder_lr==0:
         for p in sam_model.parameters():
             p.requires_grad = False
+        if video_propagation_trainer is not None:
+            for p in video_propagation_trainer.sam3_video_model.tracker.parameters():
+                p.requires_grad = False
     else:
         for p in sam_model.parameters():
             p.requires_grad = True
+        if video_propagation_trainer is not None:
+            for p in video_propagation_trainer.sam3_video_model.tracker.parameters():
+                p.requires_grad = True
 
     if args.sam_encoder_lr is None or args.sam_encoder_lr==0:
         for p in sam_vision_encoder.parameters():
@@ -242,7 +255,16 @@ def build_model(args: TrainingArguments):
         if any(
             [
                 x in n
-                for x in ["lm_head", "embed_tokens", "text_hidden_fcs", "mask_hidden_fcs", "video_query_projector", "video_query_alpha", "mask_queries"]
+                for x in [
+                    "lm_head",
+                    "embed_tokens",
+                    "text_hidden_fcs",
+                    "mask_hidden_fcs",
+                    "video_query_projector",
+                    "video_query_alpha",
+                    "mask_queries",
+                    "video_propagation_trainer",
+                ]
             ]
         ):
             # print(n)

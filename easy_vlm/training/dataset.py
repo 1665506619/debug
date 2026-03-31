@@ -246,6 +246,10 @@ class DataCollator(object):
         batch["mask_type"] = [x["mask_type"] for x in instances]
         batch["mask_ids"] = [x["mask_ids"] for x in instances]
         batch["modalities"] = [x["sample_modality"] for x in instances]
+        batch["seg_phrases"] = [x.get("seg_phrases", []) for x in instances]
+        batch["video_sam_frames"] = [x.get("video_sam_frames") for x in instances]
+        batch["video_clip_masks"] = [x.get("video_clip_masks") for x in instances]
+        batch["video_clip_mask_valid"] = [x.get("video_clip_mask_valid") for x in instances]
 
         return batch
 
@@ -319,6 +323,10 @@ class DataCollator(object):
         batch["mask_type"] = [x["mask_type"] for x in instances]
         batch["mask_ids"] = [x["mask_ids"] for x in instances]
         batch["modalities"] = [x["sample_modality"] for x in instances]
+        batch["seg_phrases"] = [x.get("seg_phrases", []) for x in instances]
+        batch["video_sam_frames"] = [x.get("video_sam_frames") for x in instances]
+        batch["video_clip_masks"] = [x.get("video_clip_masks") for x in instances]
+        batch["video_clip_mask_valid"] = [x.get("video_clip_mask_valid") for x in instances]
 
         return batch
 
@@ -672,6 +680,15 @@ class SFTDataset(Dataset):
                 f"frame_idx contains out-of-range indices for a video with {len(frame_paths)} frames: {frame_idx}"
             ) from exc
 
+    def _build_frame_candidates(self, sampled_index, sampled_path=None, original_frame_idx=None):
+        candidates = [sampled_index, str(sampled_index)]
+        if original_frame_idx is not None:
+            candidates.extend([original_frame_idx, str(original_frame_idx)])
+        if sampled_path is not None:
+            frame_stem = os.path.splitext(os.path.basename(sampled_path))[0]
+            candidates.append(frame_stem)
+        return candidates
+
     def _resolve_video_input(self, data_dict):
         video_value = data_dict["video"]
         frame_idx = data_dict.get("frame_idx")
@@ -690,14 +707,18 @@ class SFTDataset(Dataset):
             )
             sampled_indices = list(metadata.frames_indices)
             sampled_paths = [frame_paths[i] for i in sampled_indices]
-            frame_candidates = []
             if frame_idx is not None:
-                original_frame_idx = [frame_idx[i] for i in sampled_indices]
-                frame_candidates.extend(
-                    [original_frame_idx[0], str(original_frame_idx[0])]
+                original_frame_indices = [frame_idx[i] for i in sampled_indices]
+            else:
+                original_frame_indices = [None] * len(sampled_indices)
+            frame_candidates = [
+                self._build_frame_candidates(
+                    sampled_index=sampled_indices[i],
+                    sampled_path=sampled_paths[i],
+                    original_frame_idx=original_frame_indices[i],
                 )
-            frame_stem = os.path.splitext(os.path.basename(sampled_paths[0]))[0]
-            frame_candidates.append(frame_stem)
+                for i in range(len(sampled_indices))
+            ]
         elif isinstance(video_value, str):
             video_path = self._resolve_local_path(video_value)
             if self._is_video_file(video_path):
@@ -710,7 +731,14 @@ class SFTDataset(Dataset):
                 )
                 sampled_indices = list(metadata.frames_indices)
                 sampled_paths = [None] * len(sampled_indices)
-                frame_candidates = [sampled_indices[0], str(sampled_indices[0])]
+                frame_candidates = [
+                    self._build_frame_candidates(
+                        sampled_index=sampled_indices[i],
+                        sampled_path=None,
+                        original_frame_idx=sampled_indices[i],
+                    )
+                    for i in range(len(sampled_indices))
+                ]
             elif os.path.isdir(video_path):
                 frame_files = _sort_frame_paths_numerically(
                     [
@@ -730,14 +758,18 @@ class SFTDataset(Dataset):
                 )
                 sampled_indices = list(metadata.frames_indices)
                 sampled_paths = [frame_files[i] for i in sampled_indices]
-                frame_candidates = []
                 if frame_idx is not None:
-                    original_frame_idx = [frame_idx[i] for i in sampled_indices]
-                    frame_candidates.extend(
-                        [original_frame_idx[0], str(original_frame_idx[0])]
+                    original_frame_indices = [frame_idx[i] for i in sampled_indices]
+                else:
+                    original_frame_indices = [None] * len(sampled_indices)
+                frame_candidates = [
+                    self._build_frame_candidates(
+                        sampled_index=sampled_indices[i],
+                        sampled_path=sampled_paths[i],
+                        original_frame_idx=original_frame_indices[i],
                     )
-                frame_stem = os.path.splitext(os.path.basename(sampled_paths[0]))[0]
-                frame_candidates.append(frame_stem)
+                    for i in range(len(sampled_indices))
+                ]
             else:
                 raise ValueError(
                     f"Unsupported video input: expected frame list, video file, or frame directory, got {video_value}"
@@ -751,7 +783,7 @@ class SFTDataset(Dataset):
             raise ValueError(f"No video frames could be sampled from {video_value}")
 
         sam_frame = self._to_pil_image(sampled_frames[0])
-        return video_content, sam_frame, frame_candidates, strict_video_mask_match
+        return video_content, sam_frame, frame_candidates, strict_video_mask_match, sampled_frames
 
     def _infer_video_mask_size(self, video_mask_dict, data_dict, fallback_image=None):
         if data_dict.get("height") is not None and data_dict.get("width") is not None:
@@ -767,12 +799,10 @@ class SFTDataset(Dataset):
             return fallback_image.size[1], fallback_image.size[0]
         raise ValueError("Unable to infer video mask size from annotation or frames")
 
-    def _select_video_mask_frame(
+    def _match_video_mask_key(
         self,
         video_mask_dict,
-        data_dict,
         frame_candidates,
-        fallback_image=None,
         strict_match=False,
     ):
         if not isinstance(video_mask_dict, dict):
@@ -803,12 +833,39 @@ class SFTDataset(Dataset):
                     break
 
         if selected_key is None:
+            return None
+        return selected_key
+
+    def _select_video_mask_frame(
+        self,
+        video_mask_dict,
+        data_dict,
+        frame_candidates,
+        fallback_image=None,
+        strict_match=False,
+        allow_fallback=True,
+    ):
+        selected_key = self._match_video_mask_key(
+            video_mask_dict,
+            frame_candidates,
+            strict_match=strict_match,
+        )
+
+        matched_sampled_frame = selected_key is not None
+        if selected_key is None:
             if strict_match:
                 raise ValueError(
                     "Unable to align video supervision to the sampled frame. "
                     f"Tried frame candidates {frame_candidates}, but annotation keys are "
                     f"{list(video_mask_dict.keys())[:8]}."
                 )
+            if not allow_fallback:
+                mask_h, mask_w = self._infer_video_mask_size(
+                    video_mask_dict,
+                    data_dict,
+                    fallback_image=fallback_image,
+                )
+                return np.zeros((mask_h, mask_w), dtype=np.uint8), matched_sampled_frame
             sorted_keys = sorted(video_mask_dict.keys(), key=_video_mask_sort_key)
             if len(sorted_keys) == 0:
                 raise ValueError("Video mask annotation dict is empty")
@@ -821,8 +878,31 @@ class SFTDataset(Dataset):
             fallback_image=fallback_image,
         )
         if mask_ann is None:
-            return np.zeros((mask_h, mask_w), dtype=np.uint8)
-        return annToMask(mask_ann, mask_h, mask_w)
+            return np.zeros((mask_h, mask_w), dtype=np.uint8), matched_sampled_frame
+        return annToMask(mask_ann, mask_h, mask_w), matched_sampled_frame
+
+    def _build_video_clip_mask(
+        self,
+        video_mask_dict,
+        data_dict,
+        frame_candidates_per_frame,
+        fallback_image=None,
+        strict_match=False,
+    ):
+        clip_masks = []
+        clip_valid = []
+        for frame_candidates in frame_candidates_per_frame:
+            frame_mask, frame_valid = self._select_video_mask_frame(
+                video_mask_dict,
+                data_dict,
+                frame_candidates,
+                fallback_image=fallback_image,
+                strict_match=strict_match,
+                allow_fallback=False,
+            )
+            clip_masks.append(frame_mask)
+            clip_valid.append(frame_valid)
+        return np.asarray(clip_masks), np.asarray(clip_valid, dtype=np.bool_)
 
     def _convert_conversation(self, data_dict):
         data_folder = self.data_root
@@ -838,6 +918,10 @@ class SFTDataset(Dataset):
         strict_video_mask_match = False
         strict_video_mask_match = False
         phrase_str = ''
+        seg_phrases = []
+        video_sam_frames = None
+        video_clip_masks = []
+        video_clip_mask_valid = []
 
         if 'height' in data_dict:
             h = data_dict['height']
@@ -863,7 +947,13 @@ class SFTDataset(Dataset):
 
         elif 'video' in data_dict and data_dict['video'] is not None:
             modal = 'video'
-            video_content, sam_frame_source, video_frame_candidates, strict_video_mask_match = self._resolve_video_input(data_dict)
+            (
+                video_content,
+                sam_frame_source,
+                video_frame_candidates,
+                strict_video_mask_match,
+                video_sam_frames,
+            ) = self._resolve_video_input(data_dict)
             new_contents.append({"type": "video", "video": video_content})
 
         else:
@@ -914,12 +1004,14 @@ class SFTDataset(Dataset):
                     phrase = phrase.lower()[0]+phrase[1:]
                     if phrase.endswith('.'):
                         phrase = phrase[:-1]  
+                    seg_phrases.append(phrase)
                     if modal=='image':
                         new_contents.append({'type': 'text', 'text': random.choice(SEG_IMAGE_QUESTIONS_PHRASE).format(phrase=phrase)})
                     else:   
                         new_contents.append({'type': 'text', 'text': random.choice(SEG_VIDEO_QUESTIONS_PHRASE).format(phrase=phrase)})
                 elif annotation['type']=='OCR':
                     phrase = annotation['text']
+                    seg_phrases.append(phrase)
                     if modal=='image':
                         new_contents.append({'type': 'text', 'text': random.choice(SEG_IMAGE_QUESTIONS_OCR).format(phrase=phrase)})
                     else:
@@ -967,16 +1059,26 @@ class SFTDataset(Dataset):
                             mask_cur = np.expand_dims(annToMask(msk, h, w), axis=0) #[1,h,w]
                             mask_all = np.maximum(mask_all, mask_cur)
                         else:
+                            prompt_mask, _ = self._select_video_mask_frame(
+                                msk,
+                                data_dict,
+                                video_frame_candidates[0],
+                                fallback_image=sam_frame_source,
+                                strict_match=strict_video_mask_match,
+                            )
                             mask_cur = np.expand_dims(
-                                self._select_video_mask_frame(
+                                prompt_mask,
+                                axis=0,
+                            )
+                            clip_masks_cur, clip_valid_cur = self._build_video_clip_mask(
                                     msk,
                                     data_dict,
                                     video_frame_candidates,
                                     fallback_image=sam_frame_source,
                                     strict_match=strict_video_mask_match,
-                                ),
-                                axis=0,
                             )
+                            video_clip_masks.append(clip_masks_cur)
+                            video_clip_mask_valid.append(clip_valid_cur)
 
                         mask_ids_inner.append(len(masks))
                         masks.append(mask_cur)
@@ -1035,6 +1137,20 @@ class SFTDataset(Dataset):
         else:
             masks = None
 
+        if len(video_clip_masks) > 0:
+            video_clip_masks = resize_nearest_like_torch(
+                np.asarray(video_clip_masks),
+                self.mask_size,
+                self.mask_size,
+            )
+            video_clip_masks = torch.from_numpy(video_clip_masks)
+            video_clip_mask_valid = torch.from_numpy(
+                np.asarray(video_clip_mask_valid, dtype=np.bool_)
+            )
+        else:
+            video_clip_masks = None
+            video_clip_mask_valid = None
+
         if 'conversations' in data_dict and data_dict['conversations'] is not None:
             if isinstance(data_dict['conversations'], str):
                 data_dict['conversations'] = json.loads(data_dict['conversations'])
@@ -1059,7 +1175,20 @@ class SFTDataset(Dataset):
             print(data_dict)
             print('==============')
 
-        return new_conversation, sam_images, sam_size, masks, mask_ids, mask_valid, mask_type, phrase_str
+        return (
+            new_conversation,
+            sam_images,
+            sam_size,
+            masks,
+            mask_ids,
+            mask_valid,
+            mask_type,
+            phrase_str,
+            seg_phrases,
+            video_sam_frames,
+            video_clip_masks,
+            video_clip_mask_valid,
+        )
 
     def _convert_conversation_instseg(self, data_dict):
         data_folder = self.data_root
@@ -1073,6 +1202,10 @@ class SFTDataset(Dataset):
         sam_frame_source = None
         video_frame_candidates = []
         phrase_str = ''
+        seg_phrases = []
+        video_sam_frames = None
+        video_clip_masks = []
+        video_clip_mask_valid = []
 
         if 'height' in data_dict:
             h = data_dict['height']
@@ -1089,7 +1222,13 @@ class SFTDataset(Dataset):
 
         elif 'video' in data_dict and data_dict['video'] is not None:
             modal = 'video'
-            video_content, sam_frame_source, video_frame_candidates, strict_video_mask_match = self._resolve_video_input(data_dict)
+            (
+                video_content,
+                sam_frame_source,
+                video_frame_candidates,
+                strict_video_mask_match,
+                video_sam_frames,
+            ) = self._resolve_video_input(data_dict)
             new_contents.append({"type": "video", "video": video_content})
 
         else:
@@ -1118,6 +1257,7 @@ class SFTDataset(Dataset):
                     phrase = phrase.lower()[0]+phrase[1:]
                     if phrase.endswith('.'):
                         phrase = phrase[:-1]  
+                    seg_phrases.append(phrase)
                     phrase_list.append(phrase)
                     
                 else:
@@ -1152,16 +1292,26 @@ class SFTDataset(Dataset):
                         if modal=='image':
                             mask_cur = np.expand_dims(annToMask(msk, h, w), axis=0) #[1,h,w]
                         else:
+                            prompt_mask, _ = self._select_video_mask_frame(
+                                msk,
+                                data_dict,
+                                video_frame_candidates[0],
+                                fallback_image=sam_frame_source,
+                                strict_match=strict_video_mask_match,
+                            )
                             mask_cur = np.expand_dims(
-                                self._select_video_mask_frame(
+                                prompt_mask,
+                                axis=0,
+                            )
+                            clip_masks_cur, clip_valid_cur = self._build_video_clip_mask(
                                     msk,
                                     data_dict,
                                     video_frame_candidates,
                                     fallback_image=sam_frame_source,
                                     strict_match=strict_video_mask_match,
-                                ),
-                                axis=0,
                             )
+                            video_clip_masks.append(clip_masks_cur)
+                            video_clip_mask_valid.append(clip_valid_cur)
 
                         mask_ids_inner.append(len(masks))
                         masks.append(mask_cur)
@@ -1220,6 +1370,20 @@ class SFTDataset(Dataset):
         else:
             masks = None
 
+        if len(video_clip_masks) > 0:
+            video_clip_masks = resize_nearest_like_torch(
+                np.asarray(video_clip_masks),
+                self.mask_size,
+                self.mask_size,
+            )
+            video_clip_masks = torch.from_numpy(video_clip_masks)
+            video_clip_mask_valid = torch.from_numpy(
+                np.asarray(video_clip_mask_valid, dtype=np.bool_)
+            )
+        else:
+            video_clip_masks = None
+            video_clip_mask_valid = None
+
         if 'conversations' in data_dict:
             for idx, conv in enumerate(data_dict['conversations']):
                 new_contents.append({'type': 'text', 'text': conv['value']})
@@ -1239,7 +1403,20 @@ class SFTDataset(Dataset):
         # print(phrase_str)
         # print('==============')
 
-        return new_conversation, sam_images, sam_size, masks, mask_ids, mask_valid, mask_type, phrase_str
+        return (
+            new_conversation,
+            sam_images,
+            sam_size,
+            masks,
+            mask_ids,
+            mask_valid,
+            mask_type,
+            phrase_str,
+            seg_phrases,
+            video_sam_frames,
+            video_clip_masks,
+            video_clip_mask_valid,
+        )
 
 
     def _preprocess(self, data_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -1248,11 +1425,50 @@ class SFTDataset(Dataset):
 
         if data_dict["type"]=="instseg":
             if random.random()>0.5:
-                conversation, sam_images, sam_size, masks, mask_ids, mask_valid, mask_type, phrase_str = self._convert_conversation_instseg(data_dict)
+                (
+                    conversation,
+                    sam_images,
+                    sam_size,
+                    masks,
+                    mask_ids,
+                    mask_valid,
+                    mask_type,
+                    phrase_str,
+                    seg_phrases,
+                    video_sam_frames,
+                    video_clip_masks,
+                    video_clip_mask_valid,
+                ) = self._convert_conversation_instseg(data_dict)
             else:
-                conversation, sam_images, sam_size, masks, mask_ids, mask_valid, mask_type, phrase_str = self._convert_conversation(data_dict)
+                (
+                    conversation,
+                    sam_images,
+                    sam_size,
+                    masks,
+                    mask_ids,
+                    mask_valid,
+                    mask_type,
+                    phrase_str,
+                    seg_phrases,
+                    video_sam_frames,
+                    video_clip_masks,
+                    video_clip_mask_valid,
+                ) = self._convert_conversation(data_dict)
         else:
-            conversation, sam_images, sam_size, masks, mask_ids, mask_valid, mask_type, phrase_str = self._convert_conversation(data_dict)
+            (
+                conversation,
+                sam_images,
+                sam_size,
+                masks,
+                mask_ids,
+                mask_valid,
+                mask_type,
+                phrase_str,
+                seg_phrases,
+                video_sam_frames,
+                video_clip_masks,
+                video_clip_mask_valid,
+            ) = self._convert_conversation(data_dict)
 
         model_inputs = self.processor.apply_chat_template(
             conversation=conversation,
@@ -1273,6 +1489,10 @@ class SFTDataset(Dataset):
         model_inputs["mask_ids"] = mask_ids
         model_inputs["mask_valid"] = mask_valid
         model_inputs["mask_type"] = mask_type
+        model_inputs["seg_phrases"] = seg_phrases
+        model_inputs["video_sam_frames"] = video_sam_frames
+        model_inputs["video_clip_masks"] = video_clip_masks
+        model_inputs["video_clip_mask_valid"] = video_clip_mask_valid
         if data_dict.get("video") is not None:
             model_inputs["sample_modality"] = "video"
         elif data_dict.get("image") is not None:
