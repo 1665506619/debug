@@ -244,6 +244,14 @@ def build_video_seg_trainer(config):
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
 
+        # RoPE caches are runtime-recomputable buffers and are no longer persisted
+        # in the local vitdet implementation. Old checkpoints may still contain them.
+        ckpt = {
+            k: v
+            for k, v in ckpt.items()
+            if not k.endswith(".attn.freqs_cis")
+        }
+
         missing_keys, unexpected_keys = sam3_video_model.load_state_dict(
             ckpt,
             strict=True,
