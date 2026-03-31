@@ -18,9 +18,17 @@ class MemoryLoggerCallback(TrainerCallback):
         mem_info = nvmlDeviceGetMemoryInfo(handle)
         temperature = nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
         power_usage = nvmlDeviceGetPowerUsage(handle) / 1000
+        allocated_mb = torch.cuda.memory_allocated(self.device_id) / 1024**2
+        reserved_mb = torch.cuda.memory_reserved(self.device_id) / 1024**2
+        max_allocated_mb = torch.cuda.max_memory_allocated(self.device_id) / 1024**2
+        max_reserved_mb = torch.cuda.max_memory_reserved(self.device_id) / 1024**2
        
         print(f"[Step {step} | Rank {self.rank} / GPU {self.device_id}] "
               f"Memory: {mem_info.used / 1024**2:.2f} MB, "
+              f"Allocated: {allocated_mb:.2f} MB, "
+              f"Reserved: {reserved_mb:.2f} MB, "
+              f"MaxAllocated: {max_allocated_mb:.2f} MB, "
+              f"MaxReserved: {max_reserved_mb:.2f} MB, "
               f"Temperature: {temperature}°C, "
               f"Power: {power_usage:.2f} W, ")
 
@@ -63,5 +71,4 @@ def create_onelogger_config(training_args, data_args):
     }
     one_logger_callback_utils = TimeEventCallback(one_logger_callback_config)
     return one_logger_callback_utils
-
 
