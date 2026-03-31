@@ -350,6 +350,22 @@ def train():
     set_seed(42)
     args = get_args()
 
+    report_to = args.report_to
+    if isinstance(report_to, str):
+        report_targets = [report_to]
+    elif report_to is None:
+        report_targets = []
+    else:
+        report_targets = list(report_to)
+    if "wandb" in report_targets:
+        try:
+            import wandb  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "report_to includes 'wandb', but the wandb package is not installed in this environment."
+            ) from exc
+        rank0_print(f"W&B logging enabled. run_name={args.run_name}, output_dir={args.output_dir}")
+
     if args.use_onelogger:
         one_logger_callback_utils = create_onelogger_config(args, args)
 

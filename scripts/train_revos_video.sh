@@ -43,6 +43,7 @@ SAM_DECODER_LR=${SAM_DECODER_LR:-5e-6}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
 WARMUP_RATIO=${WARMUP_RATIO:-0.03}
 LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-cosine}
+REPORT_TO=${REPORT_TO:-none}
 
 mkdir -p "$(dirname "${TRAIN_JSON}")" "${OUTPUT_DIR}"
 
@@ -101,7 +102,7 @@ export OMP_NUM_THREADS
   --save_strategy steps \
   --save_steps "${SAVE_STEPS}" \
   --save_total_limit "${SAVE_TOTAL_LIMIT}" \
-  --report_to none \
+  --report_to "${REPORT_TO}" \
   --group_by_modality_length True \
   --use_multi_objs False \
   --skip_none False \

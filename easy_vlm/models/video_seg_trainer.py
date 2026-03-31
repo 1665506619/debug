@@ -139,21 +139,17 @@ class VideoSegTrainer(nn.Module):
             ):
                 frame_outputs[out_frame_idx] = out
 
+        # These per-video caches are only needed during propagation. Do not return
+        # them to the caller, otherwise Python keeps large graphs/state alive longer
+        # than necessary and memory climbs over training steps.
+        self.sam3_video_model.reset_state(inference_state)
+        del inference_state
+
         return {
             "phrase": phrase,
             "start_frame": start_frame,
             "num_frames": num_frames,
             "frame_outputs": frame_outputs,
-            "pred_masks_per_frame": [
-                None if out is None else out["pred_mask_logits"] for out in frame_outputs
-            ],
-            "pred_scores_per_frame": [
-                None if out is None else out["out_probs"] for out in frame_outputs
-            ],
-            "tracked_obj_ids": [
-                None if out is None else out["out_obj_ids"] for out in frame_outputs
-            ],
-            "inference_state": inference_state,
         }
 
 

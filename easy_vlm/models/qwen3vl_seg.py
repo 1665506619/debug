@@ -561,6 +561,10 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     gt_masks_cur,
                     mask_type_value,
                 )
+                # Release this frame's autograd-heavy outputs as soon as its loss
+                # has been accounted for, instead of keeping the whole video graph
+                # alive until the end of the group.
+                video_result["frame_outputs"][frame_idx] = None
                 if (
                     frame_losses["num_masks"] == 0
                     and frame_losses["num_cls"] == 0
@@ -580,6 +584,8 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                         result[result_key] = result[result_key] + value
                 result[f"{prefix}_num_masks"] += frame_losses["num_masks"]
                 result[f"{prefix}_num_cls"] += frame_losses["num_cls"]
+
+            del video_result
 
         return result
 
