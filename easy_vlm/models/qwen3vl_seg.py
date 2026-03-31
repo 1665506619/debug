@@ -37,6 +37,7 @@ from .assigner import HungarianAssigner
 from easy_vlm.constants import IGNORE_INDEX
 from .omni_attention import omni_attn_mask_naive, full_attn_mask, fused_full_attn_mask
 from .point_sample import sample_points
+import torch.distributed as dist
 
 @dataclass
 class Qwen3VLSegModelOutputWithPast(ModelOutput):
@@ -347,6 +348,8 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             ce_loss_weight=config.bce_loss_weight,
             cls_loss_weight=config.cls_loss_weight,
         )
+        self._video_spike_log_count = 0
+        self._video_spike_log_limit = 20
         self._reset_generation_state()
 
     def get_model(self):
@@ -365,6 +368,41 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             self.config,
         )
         return self.video_propagation_trainer
+
+    def _should_log_video_spike(self) -> bool:
+        if self._video_spike_log_count >= self._video_spike_log_limit:
+            return False
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+        return True
+
+    def _maybe_log_video_spike(
+        self,
+        *,
+        data_index: Any,
+        seg_phrases: Any,
+        video_frame_count: Optional[int],
+        video_valid_count: Optional[int],
+        sample_video_losses: Dict[str, Any],
+        mask_bce_loss_value: float,
+    ) -> None:
+        if not self._should_log_video_spike():
+            return
+        self._video_spike_log_count += 1
+        print(
+            "[video-loss-spike] "
+            f"count={self._video_spike_log_count}/{self._video_spike_log_limit} "
+            f"data_index={data_index} "
+            f"mask_bce_loss={mask_bce_loss_value:.4f} "
+            f"worst_frame_bce={sample_video_losses.get('max_frame_mask_bce')} "
+            f"worst_frame_idx={sample_video_losses.get('max_frame_idx')} "
+            f"worst_group_idx={sample_video_losses.get('max_group_idx')} "
+            f"start_frame={sample_video_losses.get('start_frame')} "
+            f"num_supervised_frames={sample_video_losses.get('num_supervised_frames')} "
+            f"num_valid_masks={video_valid_count} "
+            f"video_frame_count={video_frame_count} "
+            f"seg_phrases={seg_phrases}"
+        )
 
     def _compute_assigned_mask_losses(
         self,
@@ -478,6 +516,11 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             "prop_num_masks": 0,
             "prop_num_cls": 0,
             "has_valid_supervision": False,
+            "max_frame_mask_bce": None,
+            "max_frame_idx": None,
+            "max_group_idx": None,
+            "start_frame": None,
+            "num_supervised_frames": 0,
         }
 
         if (
@@ -518,6 +561,8 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             start_frame = int(
                 torch.nonzero(group_video_valid.any(dim=0), as_tuple=False)[0].item()
             )
+            if result["start_frame"] is None:
+                result["start_frame"] = start_frame
             video_result = self.video_propagation_trainer.segment_with_phrase_and_queries(
                 phrase=group_phrase,
                 external_query_embed=pred_embeddings[group_idx],
@@ -530,6 +575,7 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 group_video_valid.any(dim=0),
                 as_tuple=False,
             ).flatten()
+            result["num_supervised_frames"] += int(supervised_frames.numel())
             for frame_idx_tensor in supervised_frames:
                 frame_idx = int(frame_idx_tensor.item())
                 frame_out = video_result["frame_outputs"][frame_idx]
@@ -561,6 +607,17 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     gt_masks_cur,
                     mask_type_value,
                 )
+                if frame_losses["mask_bce_sum"] is not None and frame_losses["num_masks"] > 0:
+                    frame_mask_bce = (
+                        frame_losses["mask_bce_sum"] / frame_losses["num_masks"]
+                    ).detach().float().item()
+                    if (
+                        result["max_frame_mask_bce"] is None
+                        or frame_mask_bce > result["max_frame_mask_bce"]
+                    ):
+                        result["max_frame_mask_bce"] = frame_mask_bce
+                        result["max_frame_idx"] = frame_idx
+                        result["max_group_idx"] = group_idx
                 # Release this frame's autograd-heavy outputs as soon as its loss
                 # has been accounted for, instead of keeping the whole video graph
                 # alive until the end of the group.
@@ -820,6 +877,19 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                                     cls_sum = cls_sum + sample_video_losses[cls_key]
                             num_masks += sample_video_losses[f"{prefix}_num_masks"]
                             num_cls += sample_video_losses[f"{prefix}_num_cls"]
+
+                        if (
+                            sample_video_losses["max_frame_mask_bce"] is not None
+                            and sample_video_losses["max_frame_mask_bce"] > 1.0
+                        ):
+                            self._maybe_log_video_spike(
+                                data_index=None if data_indices is None else data_indices[i],
+                                seg_phrases=[] if seg_phrases is None else seg_phrases[i],
+                                video_frame_count=None if video_sam_frames is None or video_sam_frames[i] is None else len(video_sam_frames[i]),
+                                video_valid_count=int(video_clip_mask_valid[i].sum().item()),
+                                sample_video_losses=sample_video_losses,
+                                mask_bce_loss_value=sample_video_losses["max_frame_mask_bce"],
+                            )
                         continue
 
                     g_pixel_values = sam_images[i].unsqueeze(0)
