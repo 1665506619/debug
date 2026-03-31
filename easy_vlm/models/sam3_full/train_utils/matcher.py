@@ -534,7 +534,13 @@ class BinaryHungarianMatcherV2(nn.Module):
         _, num_queries = outputs["pred_logits"].shape[:2]
 
         out_score = outputs["pred_logits"].squeeze(-1)  # (B, Q)
-        out_bbox = outputs["pred_boxes"]  # (B, Q, 4))
+        use_box_cost = self.cost_bbox != 0 or self.cost_giou != 0
+        out_bbox = outputs.get("pred_boxes", None)
+        if use_box_cost and out_bbox is None:
+            raise KeyError(
+                "BinaryHungarianMatcherV2 needs outputs['pred_boxes'] when "
+                "cost_bbox or cost_giou is non-zero"
+            )
 
         device = out_score.device
 
@@ -563,26 +569,39 @@ class BinaryHungarianMatcherV2(nn.Module):
             if repeat_batch > 1:
                 batch_keep = batch_keep.repeat(repeat_batch)
             out_score = out_score[batch_keep]
-            out_bbox = out_bbox[batch_keep]
+            if out_bbox is not None:
+                out_bbox = out_bbox[batch_keep]
             if out_is_valid is not None:
                 out_is_valid = out_is_valid[batch_keep]
-        assert out_bbox.shape[0] == tgt_bbox.shape[0]
-        assert out_bbox.shape[0] == num_boxes.shape[0]
+        assert out_score.shape[0] == tgt_bbox.shape[0]
+        assert out_score.shape[0] == num_boxes.shape[0]
 
-        # Compute the L1 cost between boxes
-        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
-
-        # Compute the giou cost betwen boxes
-        cost_giou = -generalized_box_iou(
-            box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox)
-        )
+        cost_shape = (out_score.shape[0], num_queries, tgt_bbox.shape[1])
+        if use_box_cost:
+            assert out_bbox.shape[0] == tgt_bbox.shape[0]
+            if self.cost_bbox != 0:
+                cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+            else:
+                cost_bbox = out_score.new_zeros(cost_shape)
+            if self.cost_giou != 0:
+                cost_giou = -generalized_box_iou(
+                    box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox)
+                )
+            else:
+                cost_giou = out_score.new_zeros(cost_shape)
+        else:
+            cost_bbox = out_score.new_zeros(cost_shape)
+            cost_giou = out_score.new_zeros(cost_shape)
 
         out_prob = self.norm(out_score)
         if not self.focal:
             cost_class = -out_prob.unsqueeze(-1).expand_as(cost_bbox)
         else:
             if self.stable:
-                rescaled_giou = (-cost_giou + 1) / 2
+                if use_box_cost:
+                    rescaled_giou = (-cost_giou + 1) / 2
+                else:
+                    rescaled_giou = 1.0
                 out_prob = out_prob.unsqueeze(-1).expand_as(cost_bbox) * rescaled_giou
                 cost_class = -self.alpha * (1 - out_prob) ** self.gamma * torch.log(
                     out_prob

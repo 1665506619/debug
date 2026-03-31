@@ -21,28 +21,47 @@ class Sam3NativeVideoLossPayload:
 
 
 class Sam3NativeVideoLossAdapter(nn.Module):
+    """
+    Current scope:
+    - native Masks loss
+    - optional native Boxes loss when frame outputs carry real detector boxes
+
+    Not wired in this adapter yet:
+    - semantic segmentation loss
+    - det/trk association losses
+    """
+
+    _OPTIONAL_OUTPUT_KEYS = ("frame_idx", "is_video_grounding_batch", "Q_det")
+
     def __init__(self, config: Any):
         super().__init__()
         self.config = config
+        self.use_box_loss = bool(
+            getattr(config, "sam3_native_video_use_box_loss", False)
+        )
 
         loss_fns_find: List[nn.Module] = [
             Masks(
                 weight_dict={
                     "loss_mask": float(
-                        getattr(config, "sam3_native_video_mask_loss_weight", config.bce_loss_weight)
+                        getattr(
+                            config,
+                            "sam3_native_video_mask_loss_weight",
+                            config.bce_loss_weight,
+                        )
                     ),
                     "loss_dice": float(
-                        getattr(config, "sam3_native_video_dice_loss_weight", config.dice_loss_weight)
+                        getattr(
+                            config,
+                            "sam3_native_video_dice_loss_weight",
+                            config.dice_loss_weight,
+                        )
                     ),
                 },
                 compute_aux=False,
                 apply_loss_to_det_queries_in_video_grounding=True,
             )
         ]
-
-        self.use_box_loss = bool(
-            getattr(config, "sam3_native_video_use_box_loss", False)
-        )
         if self.use_box_loss:
             loss_fns_find.append(
                 Boxes(
@@ -55,6 +74,7 @@ class Sam3NativeVideoLossAdapter(nn.Module):
                         ),
                     },
                     compute_aux=False,
+                    apply_loss_to_det_queries_in_video_grounding=True,
                 )
             )
 
@@ -66,11 +86,15 @@ class Sam3NativeVideoLossAdapter(nn.Module):
                     max(float(getattr(config, "cls_loss_weight", 0.5)), 1e-3),
                 )
             ),
-            cost_bbox=float(
-                getattr(config, "sam3_native_video_matcher_cost_bbox", 1.0)
+            cost_bbox=(
+                float(getattr(config, "sam3_native_video_matcher_cost_bbox", 1.0))
+                if self.use_box_loss
+                else 0.0
             ),
-            cost_giou=float(
-                getattr(config, "sam3_native_video_matcher_cost_giou", 1.0)
+            cost_giou=(
+                float(getattr(config, "sam3_native_video_matcher_cost_giou", 1.0))
+                if self.use_box_loss
+                else 0.0
             ),
             focal=False,
             remove_samples_with_0_gt=True,
@@ -86,19 +110,19 @@ class Sam3NativeVideoLossAdapter(nn.Module):
         )
 
     @staticmethod
-    def _normalize_xyxy_boxes(boxes_xyxy: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    def _normalize_xyxy_boxes(
+        boxes_xyxy: torch.Tensor, height: int, width: int
+    ) -> torch.Tensor:
         if boxes_xyxy.numel() == 0:
             return boxes_xyxy.reshape(-1, 4)
-        boxes_xyxy = boxes_xyxy.to(dtype=torch.float32)
+        boxes_xyxy = boxes_xyxy.to(dtype=torch.float32).clone()
         boxes_xyxy[:, [0, 2]] /= max(float(width), 1.0)
         boxes_xyxy[:, [1, 3]] /= max(float(height), 1.0)
         return boxes_xyxy.clamp_(0.0, 1.0)
 
     @staticmethod
     def _ensure_bool_masks(masks: torch.Tensor) -> torch.Tensor:
-        if masks.dtype == torch.bool:
-            return masks
-        return masks > 0
+        return masks if masks.dtype == torch.bool else masks > 0
 
     @staticmethod
     def _masks_to_boxes_safe(masks: torch.Tensor) -> torch.Tensor:
@@ -106,52 +130,85 @@ class Sam3NativeVideoLossAdapter(nn.Module):
         if masks.numel() == 0:
             return torch.zeros((0, 4), device=masks.device, dtype=torch.float32)
 
-        num_masks, height, width = masks.shape
+        _, height, width = masks.shape
         y = torch.arange(height, dtype=torch.float32, device=masks.device)
         x = torch.arange(width, dtype=torch.float32, device=masks.device)
         yy, xx = torch.meshgrid(y, x, indexing="ij")
 
         x_mask = masks * xx.unsqueeze(0)
         y_mask = masks * yy.unsqueeze(0)
-        x_max = x_mask.flatten(1).max(dim=1).values + 1.0
-        y_max = y_mask.flatten(1).max(dim=1).values + 1.0
         valid = masks.flatten(1).any(dim=1)
         x_min = x_mask.masked_fill(~masks, float("inf")).flatten(1).min(dim=1).values
         y_min = y_mask.masked_fill(~masks, float("inf")).flatten(1).min(dim=1).values
+        x_max = x_mask.flatten(1).max(dim=1).values + 1.0
+        y_max = y_mask.flatten(1).max(dim=1).values + 1.0
 
         boxes = torch.stack([x_min, y_min, x_max, y_max], dim=1)
         boxes = boxes.masked_fill(~valid[:, None], 0.0)
         return boxes
 
     def _build_output_from_raw_frame(self, raw_frame_out: Dict[str, Any]) -> Dict[str, Any]:
-        pred_mask_logits = raw_frame_out["pred_mask_logits"]
-        out_score_logits = raw_frame_out["out_score_logits"]
-        if pred_mask_logits.dim() != 3:
-            raise ValueError(
-                f"Expected pred_mask_logits to have shape [Q,H,W], got {tuple(pred_mask_logits.shape)}"
-            )
-        if out_score_logits.dim() != 1:
-            raise ValueError(
-                f"Expected out_score_logits to have shape [Q], got {tuple(out_score_logits.shape)}"
-            )
-        if pred_mask_logits.shape[0] != out_score_logits.shape[0]:
-            raise ValueError(
-                "Mismatch between number of masks and logits in raw_frame_out: "
-                f"{pred_mask_logits.shape[0]} vs {out_score_logits.shape[0]}"
+        required_keys = ("pred_logits", "pred_masks")
+        missing_keys = [key for key in required_keys if key not in raw_frame_out]
+        if missing_keys:
+            raise KeyError(
+                "raw_frame_out is missing required native SAM3 output keys: "
+                + ", ".join(missing_keys)
             )
 
-        height, width = pred_mask_logits.shape[-2:]
-        pred_boxes_xyxy = self._masks_to_boxes_safe(pred_mask_logits > 0)
-        pred_boxes_xyxy = self._normalize_xyxy_boxes(pred_boxes_xyxy, height, width)
-        pred_boxes = box_xyxy_to_cxcywh(pred_boxes_xyxy)
-        return {
-            "pred_masks": pred_mask_logits.unsqueeze(0),
-            "pred_logits": out_score_logits.view(1, -1, 1),
-            "pred_boxes": pred_boxes.unsqueeze(0).to(pred_mask_logits),
-            "pred_boxes_xyxy": pred_boxes_xyxy.unsqueeze(0).to(pred_mask_logits),
-            "out_obj_ids": raw_frame_out.get("out_obj_ids"),
-            "frame_idx": raw_frame_out.get("frame_idx"),
+        pred_logits = raw_frame_out["pred_logits"]
+        pred_masks = raw_frame_out["pred_masks"]
+        if pred_logits.dim() != 3 or pred_logits.shape[0] != 1 or pred_logits.shape[-1] != 1:
+            raise ValueError(
+                "Expected pred_logits to have shape [1, Q, 1], got "
+                f"{tuple(pred_logits.shape)}"
+            )
+        if pred_masks.dim() != 4 or pred_masks.shape[0] != 1:
+            raise ValueError(
+                "Expected pred_masks to have shape [1, Q, H, W], got "
+                f"{tuple(pred_masks.shape)}"
+            )
+        if pred_logits.shape[1] != pred_masks.shape[1]:
+            raise ValueError(
+                "Mismatch between logits and masks query dims: "
+                f"{pred_logits.shape[1]} vs {pred_masks.shape[1]}"
+            )
+
+        output_dict = {
+            "pred_logits": pred_logits,
+            "pred_masks": pred_masks,
         }
+
+        has_pred_boxes = "pred_boxes" in raw_frame_out or "pred_boxes_xyxy" in raw_frame_out
+        if has_pred_boxes:
+            if "pred_boxes" not in raw_frame_out or "pred_boxes_xyxy" not in raw_frame_out:
+                raise KeyError(
+                    "raw_frame_out must provide both pred_boxes and pred_boxes_xyxy together"
+                )
+            pred_boxes = raw_frame_out["pred_boxes"]
+            pred_boxes_xyxy = raw_frame_out["pred_boxes_xyxy"]
+            if pred_boxes.dim() != 3 or pred_boxes.shape != (1, pred_logits.shape[1], 4):
+                raise ValueError(
+                    "Expected pred_boxes to have shape [1, Q, 4], got "
+                    f"{tuple(pred_boxes.shape)}"
+                )
+            if pred_boxes_xyxy.dim() != 3 or pred_boxes_xyxy.shape != (1, pred_logits.shape[1], 4):
+                raise ValueError(
+                    "Expected pred_boxes_xyxy to have shape [1, Q, 4], got "
+                    f"{tuple(pred_boxes_xyxy.shape)}"
+                )
+            output_dict["pred_boxes"] = pred_boxes
+            output_dict["pred_boxes_xyxy"] = pred_boxes_xyxy
+        elif self.use_box_loss:
+            raise ValueError(
+                "sam3_native_video_use_box_loss=True but raw_frame_out does not carry "
+                "real pred_boxes/pred_boxes_xyxy"
+            )
+
+        for key in self._OPTIONAL_OUTPUT_KEYS:
+            if key in raw_frame_out and raw_frame_out[key] is not None:
+                output_dict[key] = raw_frame_out[key]
+        return output_dict
 
     def _build_target_for_frame(
         self,
@@ -162,7 +219,7 @@ class Sam3NativeVideoLossAdapter(nn.Module):
         gt_masks = self._ensure_bool_masks(gt_masks)
         if gt_masks.dim() != 3:
             raise ValueError(
-                f"Expected gt_masks to have shape [N,H,W], got {tuple(gt_masks.shape)}"
+                f"Expected gt_masks to have shape [N, H, W], got {tuple(gt_masks.shape)}"
             )
 
         device = gt_masks.device
@@ -179,8 +236,11 @@ class Sam3NativeVideoLossAdapter(nn.Module):
                 )
 
         is_valid_mask = gt_masks.flatten(1).any(dim=1)
-        boxes_xyxy = self._masks_to_boxes_safe(gt_masks)
-        boxes_xyxy = self._normalize_xyxy_boxes(boxes_xyxy, height, width)
+        boxes_xyxy = self._normalize_xyxy_boxes(
+            self._masks_to_boxes_safe(gt_masks),
+            height,
+            width,
+        )
         boxes = box_xyxy_to_cxcywh(boxes_xyxy)
 
         return {
@@ -224,8 +284,8 @@ class Sam3NativeVideoLossAdapter(nn.Module):
             supervised_frame_indices = list(supervised_frame_indices)
             if len(supervised_frame_indices) != len(raw_frame_outputs):
                 raise ValueError(
-                    "supervised_frame_indices and raw_frame_outputs must have the same length, got "
-                    f"{len(supervised_frame_indices)} vs {len(raw_frame_outputs)}"
+                    "supervised_frame_indices and raw_frame_outputs must have the same "
+                    f"length, got {len(supervised_frame_indices)} vs {len(raw_frame_outputs)}"
                 )
 
         stages = SAM3Output()

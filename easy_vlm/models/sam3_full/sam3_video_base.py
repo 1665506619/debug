@@ -184,16 +184,30 @@ class Sam3VideoBase(nn.Module):
         # It returns a "det_out" dict for `frame_idx` and fills SAM2 backbone features for `frame_idx`
         # into `feature_cache`. Despite its distributed inference under the hood, the results would be
         # the same as if it is running backbone and detector for every frame on a single GPU.
-        det_out = self.run_backbone_and_detection(
-            frame_idx=frame_idx,
-            num_frames=num_frames,
-            reverse=reverse,
-            input_batch=input_batch,
-            geometric_prompt=geometric_prompt,
-            feature_cache=feature_cache,
-            allow_new_detections=allow_new_detections,
-            external_query_embed=external_query_embed,
-        )
+        detector_raw_out = None
+        if return_raw_outputs:
+            det_out, detector_raw_out = self.run_backbone_and_detection(
+                frame_idx=frame_idx,
+                num_frames=num_frames,
+                reverse=reverse,
+                input_batch=input_batch,
+                geometric_prompt=geometric_prompt,
+                feature_cache=feature_cache,
+                allow_new_detections=allow_new_detections,
+                external_query_embed=external_query_embed,
+                return_detector_raw_outputs=True,
+            )
+        else:
+            det_out = self.run_backbone_and_detection(
+                frame_idx=frame_idx,
+                num_frames=num_frames,
+                reverse=reverse,
+                input_batch=input_batch,
+                geometric_prompt=geometric_prompt,
+                feature_cache=feature_cache,
+                allow_new_detections=allow_new_detections,
+                external_query_embed=external_query_embed,
+            )
 
         # Step 2: each GPU propagates its local SAM2 states to get the SAM2 prediction masks.
         # the returned `tracker_low_res_masks_global` contains the concatenated masklet predictions
@@ -277,14 +291,7 @@ class Sam3VideoBase(nn.Module):
             if return_raw_outputs:
                 raw_frame_outputs = self.build_training_outputs(
                     frame_idx=frame_idx,
-                    det_out=det_out,
-                    tracker_low_res_masks_global=tracker_low_res_masks_global,
-                    tracker_obj_scores_global=tracker_obj_scores_global,
-                    tracker_metadata_prev=tracker_metadata_prev,
-                    tracker_update_plan=tracker_update_plan,
-                    orig_vid_height=orig_vid_height,
-                    orig_vid_width=orig_vid_width,
-                    reconditioned_obj_ids=reconditioned_obj_ids,
+                    sam3_image_out=detector_raw_out,
                 )
             obj_id_to_score = tracker_metadata_new["obj_id_to_score"]
         else:
@@ -343,6 +350,7 @@ class Sam3VideoBase(nn.Module):
         reverse: bool,
         allow_new_detections: bool,
         external_query_embed=None,
+        return_detector_raw_outputs: bool = False,
     ):
         # Step 1: if text feature is not cached in `feature_cache`, compute and cache it
         text_batch_key = tuple(input_batch.find_text_batch)
@@ -425,6 +433,8 @@ class Sam3VideoBase(nn.Module):
         )
         # remove from `feature_cache` old features to save GPU memory
         feature_cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
+        if return_detector_raw_outputs:
+            return det_out, sam3_image_out
         return det_out
 
     def run_tracker_propagation(
@@ -1063,124 +1073,32 @@ class Sam3VideoBase(nn.Module):
     def build_training_outputs(
         self,
         frame_idx: int,
-        det_out: Dict[str, Tensor],
-        tracker_low_res_masks_global: Tensor,
-        tracker_obj_scores_global: Tensor,
-        tracker_metadata_prev: Dict[str, npt.NDArray],
-        tracker_update_plan: Dict[str, npt.NDArray],
-        orig_vid_height: int,
-        orig_vid_width: int,
-        reconditioned_obj_ids: set = None,
+        sam3_image_out: Dict[str, Tensor],
     ):
-        new_det_fa_inds: npt.NDArray = tracker_update_plan["new_det_fa_inds"]
-        new_det_obj_ids: npt.NDArray = tracker_update_plan["new_det_obj_ids"]
+        if sam3_image_out is None:
+            raise ValueError("sam3_image_out must be provided for training outputs")
 
-        device = tracker_low_res_masks_global.device
-        if device.type == "cpu" and det_out["mask"].numel() > 0:
-            device = det_out["mask"].device
-
-        obj_ids = []
-        mask_logits = []
-        score_probs = []
-
-        existing_masklet_obj_ids = tracker_metadata_prev["obj_ids_all_gpu"]
-        if tracker_low_res_masks_global.shape[0] > 0:
-            existing_masklet_video_res_masks = F.interpolate(
-                tracker_low_res_masks_global.unsqueeze(1),
-                size=(orig_vid_height, orig_vid_width),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-            existing_scores = tracker_obj_scores_global.sigmoid()
-
-            obj_ids.extend(existing_masklet_obj_ids.tolist())
-            mask_logits.append(existing_masklet_video_res_masks)
-            score_probs.append(existing_scores)
-
-        if len(new_det_obj_ids) > 0:
-            new_det_fa_inds_t = torch.as_tensor(
-                new_det_fa_inds,
-                device=det_out["mask"].device,
-                dtype=torch.long,
+        required_keys = ("pred_logits", "pred_masks", "pred_boxes", "pred_boxes_xyxy")
+        missing_keys = [key for key in required_keys if key not in sam3_image_out]
+        if missing_keys:
+            raise KeyError(
+                "sam3_image_out is missing required native training keys: "
+                + ", ".join(missing_keys)
             )
-            new_det_low_res_masks = det_out["mask"][new_det_fa_inds_t].unsqueeze(1)
-            new_det_low_res_masks = fill_holes_in_mask_scores(
-                new_det_low_res_masks,
-                max_area=self.fill_hole_area,
-                fill_holes=True,
-                remove_sprinkles=True,
-            )
-            new_masklet_video_res_masks = F.interpolate(
-                new_det_low_res_masks,
-                size=(orig_vid_height, orig_vid_width),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-            new_det_scores = det_out["scores"][new_det_fa_inds_t]
 
-            obj_ids.extend(new_det_obj_ids.tolist())
-            mask_logits.append(new_masklet_video_res_masks)
-            score_probs.append(new_det_scores)
-
-        if len(obj_ids) == 0:
-            empty_masks = torch.zeros(
-                0,
-                orig_vid_height,
-                orig_vid_width,
-                device=device,
-                dtype=det_out["mask"].dtype,
-            )
-            empty_scores = torch.zeros(0, device=device, dtype=det_out["scores"].dtype)
-            empty_score_logits = torch.zeros(
-                0,
-                device=device,
-                dtype=det_out["score_logits"].dtype,
-            )
-            empty_ids = torch.zeros(0, device=device, dtype=torch.long)
-            return {
-                "frame_idx": frame_idx,
-                "out_obj_ids": empty_ids,
-                "pred_mask_logits": empty_masks,
-                "out_probs": empty_scores,
-                "out_score_logits": empty_score_logits,
-            }
-
-        pred_mask_logits = torch.cat(mask_logits, dim=0)
-        out_probs = torch.cat(score_probs, dim=0)
-        out_score_logits_list = []
-        if tracker_low_res_masks_global.shape[0] > 0:
-            out_score_logits_list.append(tracker_obj_scores_global)
-        if len(new_det_obj_ids) > 0:
-            out_score_logits_list.append(det_out["score_logits"][new_det_fa_inds_t])
-        out_score_logits = torch.cat(out_score_logits_list, dim=0)
-        out_obj_ids = torch.tensor(obj_ids, dtype=torch.long, device=pred_mask_logits.device)
-
-        if reconditioned_obj_ids:
-            trk_id_to_max_iou_high_conf_det = tracker_update_plan.get(
-                "trk_id_to_max_iou_high_conf_det", {}
-            )
-            obj_id_to_index = {obj_id: idx for idx, obj_id in enumerate(obj_ids)}
-            for obj_id in reconditioned_obj_ids:
-                det_idx = trk_id_to_max_iou_high_conf_det.get(obj_id)
-                out_idx = obj_id_to_index.get(obj_id)
-                if det_idx is None or out_idx is None:
-                    continue
-                det_mask = det_out["mask"][det_idx : det_idx + 1].unsqueeze(1)
-                det_mask = F.interpolate(
-                    det_mask,
-                    size=(orig_vid_height, orig_vid_width),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(1)
-                pred_mask_logits[out_idx : out_idx + 1] = det_mask
-
-        return {
+        training_out = {
             "frame_idx": frame_idx,
-            "out_obj_ids": out_obj_ids,
-            "pred_mask_logits": pred_mask_logits,
-            "out_probs": out_probs,
-            "out_score_logits": out_score_logits,
+            "pred_logits": sam3_image_out["pred_logits"],
+            "pred_masks": sam3_image_out["pred_masks"],
+            "pred_boxes": sam3_image_out["pred_boxes"],
+            "pred_boxes_xyxy": sam3_image_out["pred_boxes_xyxy"],
+            "pred_mask_logits": sam3_image_out["pred_masks"].squeeze(0),
+            "out_score_logits": sam3_image_out["pred_logits"].squeeze(0).squeeze(-1),
         }
+        for key in ("is_video_grounding_batch", "Q_det"):
+            if key in sam3_image_out:
+                training_out[key] = sam3_image_out[key]
+        return training_out
 
     def _get_objects_to_suppress_based_on_most_recently_occluded(
         self,
