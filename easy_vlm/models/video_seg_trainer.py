@@ -6,14 +6,20 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 
+from .sam3_native_video_loss import Sam3NativeVideoLossAdapter
 from .segmentation_decoder import _resolve_sam3_checkpoint_path
 from .sam3_full.sam3_video_inference import Sam3VideoInferenceWithInstanceInteractivity
 
 
 class VideoSegTrainer(nn.Module):
-    def __init__(self, sam3_video_model: nn.Module):
+    def __init__(
+        self,
+        sam3_video_model: nn.Module,
+        sam3_native_video_loss: Optional[Sam3NativeVideoLossAdapter] = None,
+    ):
         super().__init__()
         self.sam3_video_model = sam3_video_model
+        self.sam3_native_video_loss = sam3_native_video_loss
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -146,6 +152,130 @@ class VideoSegTrainer(nn.Module):
             "frame_outputs": frame_outputs,
         }
 
+    def forward_video_with_phrase_and_queries_for_loss(
+        self,
+        phrase: str,
+        external_query_embed: torch.Tensor,
+        video_masks: torch.Tensor,
+        video_mask_valid: torch.Tensor,
+        object_ids: Optional[torch.Tensor] = None,
+        inference_state: Optional[Dict[str, Any]] = None,
+        resource_path=None,
+        frames: Optional[Sequence[Any]] = None,
+        start_frame: Optional[int] = None,
+        max_frame_num_to_track: Optional[int] = None,
+        init_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if self.sam3_native_video_loss is None:
+            raise RuntimeError("sam3_native_video_loss is not initialized")
+        if not phrase:
+            raise ValueError("phrase must be a non-empty string")
+        if external_query_embed is None:
+            raise ValueError("external_query_embed must not be None")
+        if external_query_embed.dim() != 2:
+            raise ValueError(
+                "external_query_embed must be a 2D tensor shaped [num_queries, dim]"
+            )
+        if video_masks is None or video_mask_valid is None:
+            raise ValueError("video_masks and video_mask_valid must not be None")
+        if video_masks.dim() != 4:
+            raise ValueError(
+                f"video_masks must have shape [N,T,H,W], got {tuple(video_masks.shape)}"
+            )
+        if video_mask_valid.dim() != 2:
+            raise ValueError(
+                "video_mask_valid must have shape [N,T], got "
+                f"{tuple(video_mask_valid.shape)}"
+            )
+        if video_masks.shape[:2] != video_mask_valid.shape:
+            raise ValueError(
+                "video_masks and video_mask_valid leading dims must match, got "
+                f"{tuple(video_masks.shape[:2])} vs {tuple(video_mask_valid.shape)}"
+            )
+        video_mask_valid = video_mask_valid.to(dtype=torch.bool)
+
+        if inference_state is None:
+            init_kwargs = {} if init_kwargs is None else dict(init_kwargs)
+            inference_state = self.init_video(
+                resource_path=resource_path,
+                frames=frames,
+                **init_kwargs,
+            )
+        if inference_state["num_frames"] != video_masks.shape[1]:
+            raise ValueError(
+                "video_masks frame count does not match initialized video state, got "
+                f"{video_masks.shape[1]} vs {inference_state['num_frames']}"
+            )
+
+        if object_ids is not None:
+            object_ids = object_ids.to(device=video_masks.device, dtype=torch.long)
+            if object_ids.numel() != video_masks.shape[0]:
+                raise ValueError(
+                    "object_ids and video_masks must have the same instance count, got "
+                    f"{object_ids.numel()} vs {video_masks.shape[0]}"
+                )
+
+        model_dtype = next(self.sam3_video_model.parameters()).dtype
+        query_embed = external_query_embed.to(device=self.device, dtype=model_dtype)
+        inference_state["constants"]["external_query_embed"] = query_embed
+        start_frame = self._resolve_start_frame(video_mask_valid, start_frame)
+
+        supervised_frames = torch.nonzero(
+            video_mask_valid.any(dim=0),
+            as_tuple=False,
+        ).flatten()
+        raw_frame_outputs: List[Dict[str, Any]] = []
+        gt_masks_per_frame: List[torch.Tensor] = []
+        object_ids_per_frame: List[Optional[torch.Tensor]] = []
+        supervised_frame_indices: List[int] = []
+
+        with self._single_rank_video_forward():
+            frame_idx, prompt_out = self.sam3_video_model.add_prompt_for_training(
+                inference_state,
+                frame_idx=start_frame,
+                text_str=phrase,
+            )
+            if video_mask_valid[:, frame_idx].any():
+                gt_valid = video_mask_valid[:, frame_idx]
+                raw_frame_outputs.append(prompt_out)
+                gt_masks_per_frame.append(video_masks[:, frame_idx][gt_valid])
+                object_ids_per_frame.append(
+                    None if object_ids is None else object_ids[gt_valid]
+                )
+                supervised_frame_indices.append(frame_idx)
+
+            for out_frame_idx, out in self.sam3_video_model.propagate_in_video_for_training(
+                inference_state,
+                start_frame_idx=start_frame,
+                max_frame_num_to_track=max_frame_num_to_track,
+                reverse=False,
+                include_start_frame=False,
+            ):
+                if not video_mask_valid[:, out_frame_idx].any():
+                    continue
+                gt_valid = video_mask_valid[:, out_frame_idx]
+                raw_frame_outputs.append(out)
+                gt_masks_per_frame.append(video_masks[:, out_frame_idx][gt_valid])
+                object_ids_per_frame.append(
+                    None if object_ids is None else object_ids[gt_valid]
+                )
+                supervised_frame_indices.append(out_frame_idx)
+
+        return self.sam3_native_video_loss.build_payload(
+            raw_frame_outputs=raw_frame_outputs,
+            gt_masks_per_frame=gt_masks_per_frame,
+            object_ids_per_frame=object_ids_per_frame,
+            supervised_frame_indices=supervised_frame_indices,
+        )
+
+    def compute_sam3_native_video_loss(self, **kwargs):
+        payload = self.forward_video_with_phrase_and_queries_for_loss(**kwargs)
+        loss_dict = self.sam3_native_video_loss.compute_loss(payload)
+        return {
+            "payload": payload,
+            "loss_dict": loss_dict,
+        }
+
 
 def build_video_seg_trainer(config):
     from iopath.common.file_io import g_pathmgr
@@ -255,6 +385,10 @@ def build_video_seg_trainer(config):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sam3_video_model.to(device=device)
-    trainer = VideoSegTrainer(sam3_video_model)
+    sam3_native_video_loss = Sam3NativeVideoLossAdapter(config)
+    trainer = VideoSegTrainer(
+        sam3_video_model,
+        sam3_native_video_loss=sam3_native_video_loss,
+    )
     trainer.train()
     return trainer

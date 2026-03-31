@@ -64,6 +64,13 @@ class Qwen3VLSegCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
+    video_sam3_core_loss: Optional[torch.FloatTensor] = None
+    video_sam3_mask_loss: Optional[torch.FloatTensor] = None
+    video_sam3_dice_loss: Optional[torch.FloatTensor] = None
+    video_sam3_bbox_loss: Optional[torch.FloatTensor] = None
+    video_sam3_giou_loss: Optional[torch.FloatTensor] = None
+    video_sam3_semantic_loss: Optional[torch.FloatTensor] = None
+    video_sam3_semantic_dice_loss: Optional[torch.FloatTensor] = None
 
 
 class Qwen3VLSegModel(_Qwen3VLModel): 
@@ -349,6 +356,12 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
             ce_loss_weight=config.bce_loss_weight,
             cls_loss_weight=config.cls_loss_weight,
         )
+        if not hasattr(config, "use_sam3_native_video_loss"):
+            config.use_sam3_native_video_loss = False
+        if not hasattr(config, "sam3_native_video_normalize_by_stage_num"):
+            config.sam3_native_video_normalize_by_stage_num = True
+        if not hasattr(config, "sam3_native_video_use_box_loss"):
+            config.sam3_native_video_use_box_loss = False
         self._video_spike_log_count = 0
         self._video_spike_log_limit = 20
         self._reset_generation_state()
@@ -671,6 +684,128 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
 
         return result
 
+    def _map_sam3_native_video_loss_keys(
+        self,
+        loss_dict: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        key_map = {
+            "core_loss": "video_sam3_core_loss",
+            "loss_mask": "video_sam3_mask_loss",
+            "loss_dice": "video_sam3_dice_loss",
+            "loss_bbox": "video_sam3_bbox_loss",
+            "loss_giou": "video_sam3_giou_loss",
+            "loss_semantic_seg": "video_sam3_semantic_loss",
+            "loss_semantic_dice": "video_sam3_semantic_dice_loss",
+        }
+        mapped = {}
+        for key, value in loss_dict.items():
+            mapped[key_map.get(key, f"video_sam3_{key}")] = value
+        return mapped
+
+    def _compute_video_sample_native_sam3_losses(
+        self,
+        pred_embeddings: torch.Tensor,
+        seg_phrases: List[str],
+        video_sam_frames,
+        video_clip_masks: torch.Tensor,
+        video_clip_mask_valid: torch.Tensor,
+        mask_id_groups,
+        mask_type_value: int,
+    ):
+        if self.video_propagation_trainer is None:
+            raise RuntimeError(
+                "video propagation trainer is not initialized. "
+                "Call initialize_video_propagation_trainer() before video training."
+            )
+        if mask_type_value != 0:
+            raise NotImplementedError(
+                "SAM3 native video loss currently only supports dense mask supervision "
+                f"(mask_type == 0), but got mask_type == {mask_type_value}."
+            )
+
+        result = {
+            "has_valid_supervision": False,
+            "loss_dict": {},
+            "num_valid_groups": 0,
+        }
+        if (
+            video_sam_frames is None
+            or video_clip_masks is None
+            or video_clip_mask_valid is None
+            or pred_embeddings.numel() == 0
+        ):
+            return result
+
+        video_clip_masks = video_clip_masks.to(device=pred_embeddings.device)
+        video_clip_mask_valid = video_clip_mask_valid.to(
+            device=pred_embeddings.device,
+            dtype=torch.bool,
+        )
+
+        num_groups = min(
+            pred_embeddings.shape[0],
+            len(seg_phrases),
+            len(mask_id_groups),
+        )
+        for group_idx in range(num_groups):
+            group_phrase = seg_phrases[group_idx]
+            group_mask_ids = mask_id_groups[group_idx]
+            if not group_phrase or len(group_mask_ids) == 0:
+                continue
+
+            group_mask_ids = torch.as_tensor(
+                group_mask_ids,
+                device=video_clip_masks.device,
+                dtype=torch.long,
+            )
+            group_video_masks = video_clip_masks[group_mask_ids]
+            group_video_valid = video_clip_mask_valid[group_mask_ids]
+            if not group_video_valid.any():
+                continue
+
+            start_frame = int(
+                torch.nonzero(group_video_valid.any(dim=0), as_tuple=False)[0].item()
+            )
+            try:
+                native_loss_result = (
+                    self.video_propagation_trainer.compute_sam3_native_video_loss(
+                        phrase=group_phrase,
+                        external_query_embed=pred_embeddings[group_idx],
+                        frames=video_sam_frames,
+                        video_masks=group_video_masks,
+                        video_mask_valid=group_video_valid,
+                        object_ids=group_mask_ids,
+                        start_frame=start_frame,
+                    )
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to compute SAM3 native video loss for "
+                    f"group_idx={group_idx}, phrase={group_phrase!r}, "
+                    f"num_group_masks={int(group_mask_ids.numel())}, start_frame={start_frame}"
+                ) from exc
+
+            loss_dict = native_loss_result["loss_dict"]
+            if not loss_dict:
+                continue
+
+            result["has_valid_supervision"] = True
+            result["num_valid_groups"] += 1
+            mapped_loss_dict = self._map_sam3_native_video_loss_keys(loss_dict)
+            for key, value in mapped_loss_dict.items():
+                if key not in result["loss_dict"]:
+                    result["loss_dict"][key] = value
+                else:
+                    result["loss_dict"][key] = result["loss_dict"][key] + value
+
+        if result["num_valid_groups"] > 0:
+            denom = float(result["num_valid_groups"])
+            result["loss_dict"] = {
+                key: value / denom for key, value in result["loss_dict"].items()
+            }
+
+        return result
+
     def _ensure_generation_state(self):
         if not hasattr(self, "SEG_START"):
             self.SEG_START = None
@@ -817,6 +952,13 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
         mask_dice_loss = None
         mask_loss = None
         cls_loss = None
+        video_sam3_core_loss = None
+        video_sam3_mask_loss = None
+        video_sam3_dice_loss = None
+        video_sam3_bbox_loss = None
+        video_sam3_giou_loss = None
+        video_sam3_semantic_loss = None
+        video_sam3_semantic_dice_loss = None
 
         if labels is not None: # training
             ce_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
@@ -836,6 +978,8 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 cls_sum = None
                 num_masks = 0
                 num_cls = 0
+                native_video_loss_sums: Dict[str, torch.Tensor] = {}
+                native_video_loss_count = 0
                 for i in range(bs):
                     input_id = input_ids[i]
                     seg_token_mask = input_id==self.config.seg_token_index
@@ -873,50 +1017,69 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                         and video_clip_masks[i] is not None
                         and video_clip_mask_valid[i] is not None
                     ):
-                        sample_video_losses = self._compute_video_sample_losses(
-                            pred_embeddings=pred_embedding,
-                            seg_phrases=[] if seg_phrases is None else seg_phrases[i],
-                            video_sam_frames=None if video_sam_frames is None else video_sam_frames[i],
-                            video_clip_masks=video_clip_masks[i],
-                            video_clip_mask_valid=video_clip_mask_valid[i],
-                            mask_id_groups=mask_ids[i],
-                            mask_type_value=mask_type[i],
-                        )
-                        if sample_video_losses["has_valid_supervision"]:
-                            batch_has_valid_mask_supervision = True
-
-                        for prefix in ["prompt", "prop"]:
-                            mask_bce_key = f"{prefix}_mask_bce_sum"
-                            mask_dice_key = f"{prefix}_mask_dice_sum"
-                            cls_key = f"{prefix}_cls_sum"
-                            if sample_video_losses[mask_bce_key] is not None:
-                                if mask_bce_sum is None:
-                                    mask_bce_sum = sample_video_losses[mask_bce_key]
-                                    mask_dice_sum = sample_video_losses[mask_dice_key]
-                                else:
-                                    mask_bce_sum = mask_bce_sum + sample_video_losses[mask_bce_key]
-                                    mask_dice_sum = mask_dice_sum + sample_video_losses[mask_dice_key]
-                            if sample_video_losses[cls_key] is not None:
-                                if cls_sum is None:
-                                    cls_sum = sample_video_losses[cls_key]
-                                else:
-                                    cls_sum = cls_sum + sample_video_losses[cls_key]
-                            num_masks += sample_video_losses[f"{prefix}_num_masks"]
-                            num_cls += sample_video_losses[f"{prefix}_num_cls"]
-
-                        if (
-                            sample_video_losses["max_frame_mask_bce"] is not None
-                            and sample_video_losses["max_frame_mask_bce"] > 1.0
-                        ):
-                            self._maybe_log_video_spike(
-                                data_index=None if data_indices is None else data_indices[i],
-                                sample_info=None if sample_infos is None else sample_infos[i],
+                        if self.config.use_sam3_native_video_loss:
+                            sample_video_losses = self._compute_video_sample_native_sam3_losses(
+                                pred_embeddings=pred_embedding,
                                 seg_phrases=[] if seg_phrases is None else seg_phrases[i],
-                                video_frame_count=None if video_sam_frames is None or video_sam_frames[i] is None else len(video_sam_frames[i]),
-                                video_valid_count=int(video_clip_mask_valid[i].sum().item()),
-                                sample_video_losses=sample_video_losses,
-                                mask_bce_loss_value=sample_video_losses["max_frame_mask_bce"],
+                                video_sam_frames=None if video_sam_frames is None else video_sam_frames[i],
+                                video_clip_masks=video_clip_masks[i],
+                                video_clip_mask_valid=video_clip_mask_valid[i],
+                                mask_id_groups=mask_ids[i],
+                                mask_type_value=mask_type[i],
                             )
+                            if sample_video_losses["has_valid_supervision"]:
+                                batch_has_valid_mask_supervision = True
+                                native_video_loss_count += 1
+                                for key, value in sample_video_losses["loss_dict"].items():
+                                    if key not in native_video_loss_sums:
+                                        native_video_loss_sums[key] = value
+                                    else:
+                                        native_video_loss_sums[key] = native_video_loss_sums[key] + value
+                        else:
+                            sample_video_losses = self._compute_video_sample_losses(
+                                pred_embeddings=pred_embedding,
+                                seg_phrases=[] if seg_phrases is None else seg_phrases[i],
+                                video_sam_frames=None if video_sam_frames is None else video_sam_frames[i],
+                                video_clip_masks=video_clip_masks[i],
+                                video_clip_mask_valid=video_clip_mask_valid[i],
+                                mask_id_groups=mask_ids[i],
+                                mask_type_value=mask_type[i],
+                            )
+                            if sample_video_losses["has_valid_supervision"]:
+                                batch_has_valid_mask_supervision = True
+
+                            for prefix in ["prompt", "prop"]:
+                                mask_bce_key = f"{prefix}_mask_bce_sum"
+                                mask_dice_key = f"{prefix}_mask_dice_sum"
+                                cls_key = f"{prefix}_cls_sum"
+                                if sample_video_losses[mask_bce_key] is not None:
+                                    if mask_bce_sum is None:
+                                        mask_bce_sum = sample_video_losses[mask_bce_key]
+                                        mask_dice_sum = sample_video_losses[mask_dice_key]
+                                    else:
+                                        mask_bce_sum = mask_bce_sum + sample_video_losses[mask_bce_key]
+                                        mask_dice_sum = mask_dice_sum + sample_video_losses[mask_dice_key]
+                                if sample_video_losses[cls_key] is not None:
+                                    if cls_sum is None:
+                                        cls_sum = sample_video_losses[cls_key]
+                                    else:
+                                        cls_sum = cls_sum + sample_video_losses[cls_key]
+                                num_masks += sample_video_losses[f"{prefix}_num_masks"]
+                                num_cls += sample_video_losses[f"{prefix}_num_cls"]
+
+                            if (
+                                sample_video_losses["max_frame_mask_bce"] is not None
+                                and sample_video_losses["max_frame_mask_bce"] > 1.0
+                            ):
+                                self._maybe_log_video_spike(
+                                    data_index=None if data_indices is None else data_indices[i],
+                                    sample_info=None if sample_infos is None else sample_infos[i],
+                                    seg_phrases=[] if seg_phrases is None else seg_phrases[i],
+                                    video_frame_count=None if video_sam_frames is None or video_sam_frames[i] is None else len(video_sam_frames[i]),
+                                    video_valid_count=int(video_clip_mask_valid[i].sum().item()),
+                                    sample_video_losses=sample_video_losses,
+                                    mask_bce_loss_value=sample_video_losses["max_frame_mask_bce"],
+                                )
                         continue
 
                     g_pixel_values = sam_images[i].unsqueeze(0)
@@ -1003,12 +1166,47 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                     cls_loss = cls_sum / num_cls
                 else:
                     cls_loss = ce_loss*0.0
+
+                if native_video_loss_count > 0:
+                    native_video_losses = {
+                        key: value / float(native_video_loss_count)
+                        for key, value in native_video_loss_sums.items()
+                    }
+                    video_sam3_core_loss = native_video_losses.get(
+                        "video_sam3_core_loss", ce_loss * 0.0
+                    )
+                    video_sam3_mask_loss = native_video_losses.get(
+                        "video_sam3_mask_loss", ce_loss * 0.0
+                    )
+                    video_sam3_dice_loss = native_video_losses.get(
+                        "video_sam3_dice_loss", ce_loss * 0.0
+                    )
+                    video_sam3_bbox_loss = native_video_losses.get(
+                        "video_sam3_bbox_loss", ce_loss * 0.0
+                    )
+                    video_sam3_giou_loss = native_video_losses.get(
+                        "video_sam3_giou_loss", ce_loss * 0.0
+                    )
+                    video_sam3_semantic_loss = native_video_losses.get(
+                        "video_sam3_semantic_loss", ce_loss * 0.0
+                    )
+                    video_sam3_semantic_dice_loss = native_video_losses.get(
+                        "video_sam3_semantic_dice_loss", ce_loss * 0.0
+                    )
+                else:
+                    video_sam3_core_loss = ce_loss * 0.0
+                    video_sam3_mask_loss = ce_loss * 0.0
+                    video_sam3_dice_loss = ce_loss * 0.0
+                    video_sam3_bbox_loss = ce_loss * 0.0
+                    video_sam3_giou_loss = ce_loss * 0.0
+                    video_sam3_semantic_loss = ce_loss * 0.0
+                    video_sam3_semantic_dice_loss = ce_loss * 0.0
                 
                 mask_bce_loss = self.config.bce_loss_weight * mask_bce_loss 
                 mask_dice_loss = self.config.dice_loss_weight * mask_dice_loss 
                 cls_loss = self.config.cls_loss_weight * cls_loss
                 mask_loss = mask_bce_loss + mask_dice_loss
-                loss = mask_loss + ce_loss + cls_loss
+                loss = mask_loss + ce_loss + cls_loss + video_sam3_core_loss
     
             if not batch_has_valid_mask_supervision:
                 # print('No valid masks found.')
@@ -1017,6 +1215,13 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 mask_dice_loss = loss * 0.0
                 mask_loss = loss * 0.0
                 cls_loss = loss * 0.0
+                video_sam3_core_loss = loss * 0.0
+                video_sam3_mask_loss = loss * 0.0
+                video_sam3_dice_loss = loss * 0.0
+                video_sam3_bbox_loss = loss * 0.0
+                video_sam3_giou_loss = loss * 0.0
+                video_sam3_semantic_loss = loss * 0.0
+                video_sam3_semantic_dice_loss = loss * 0.0
 
 
         if mask_loss is not None: # training
@@ -1027,6 +1232,13 @@ class Qwen3VLSegForConditionalGeneration(_Qwen3VLForConditionalGeneration):
                 mask_dice_loss=mask_dice_loss.detach(),
                 mask_loss=mask_loss.detach(),
                 cls_loss=cls_loss.detach(),
+                video_sam3_core_loss=video_sam3_core_loss.detach(),
+                video_sam3_mask_loss=video_sam3_mask_loss.detach(),
+                video_sam3_dice_loss=video_sam3_dice_loss.detach(),
+                video_sam3_bbox_loss=video_sam3_bbox_loss.detach(),
+                video_sam3_giou_loss=video_sam3_giou_loss.detach(),
+                video_sam3_semantic_loss=video_sam3_semantic_loss.detach(),
+                video_sam3_semantic_dice_loss=video_sam3_semantic_dice_loss.detach(),
                 logits=logits,
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
