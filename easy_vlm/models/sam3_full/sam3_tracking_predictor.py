@@ -54,8 +54,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         self.iter_use_prev_mask_pred = True
         self.add_all_frames_to_correct_as_cond = True
 
-    @torch.inference_mode()
-    def init_state(
+    def _init_state_impl(
         self,
         video_height=None,
         video_width=None,
@@ -135,6 +134,52 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         inference_state["frames_already_tracked"] = {}
         self.clear_all_points_in_video(inference_state)
         return inference_state
+
+    @torch.inference_mode()
+    def init_state(
+        self,
+        video_height=None,
+        video_width=None,
+        num_frames=None,
+        video_path=None,
+        cached_features=None,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
+        async_loading_frames=False,
+    ):
+        """Initialize an inference state."""
+        return self._init_state_impl(
+            video_height=video_height,
+            video_width=video_width,
+            num_frames=num_frames,
+            video_path=video_path,
+            cached_features=cached_features,
+            offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
+            async_loading_frames=async_loading_frames,
+        )
+
+    def init_state_for_training(
+        self,
+        video_height=None,
+        video_width=None,
+        num_frames=None,
+        video_path=None,
+        cached_features=None,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
+        async_loading_frames=False,
+    ):
+        return self._init_state_impl(
+            video_height=video_height,
+            video_width=video_width,
+            num_frames=num_frames,
+            video_path=video_path,
+            cached_features=cached_features,
+            offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
+            async_loading_frames=async_loading_frames,
+        )
 
     def _obj_id_to_idx(self, inference_state, obj_id):
         """Map client-side object id to model-side object index."""
@@ -340,8 +385,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         low_res_masks = None  # not needed by the demo
         return frame_idx, obj_ids, low_res_masks, video_res_masks
 
-    @torch.inference_mode()
-    def add_new_mask(
+    def _add_new_mask_impl(
         self,
         inference_state,
         frame_idx,
@@ -458,6 +502,40 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         )
         low_res_masks = None  # not needed by the demo
         return frame_idx, obj_ids, low_res_masks, video_res_masks
+
+    @torch.inference_mode()
+    def add_new_mask(
+        self,
+        inference_state,
+        frame_idx,
+        obj_id,
+        mask,
+        add_mask_to_memory=False,
+    ):
+        """Add new mask to a frame."""
+        return self._add_new_mask_impl(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask=mask,
+            add_mask_to_memory=add_mask_to_memory,
+        )
+
+    def add_new_mask_for_training(
+        self,
+        inference_state,
+        frame_idx,
+        obj_id,
+        mask,
+        add_mask_to_memory=False,
+    ):
+        return self._add_new_mask_impl(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask=mask,
+            add_mask_to_memory=add_mask_to_memory,
+        )
 
     def add_new_points(self, *args, **kwargs):
         """Deprecated method. Please use `add_new_points_or_box` instead."""
@@ -670,8 +748,9 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         )
         return current_out["obj_ptr"]
 
-    @torch.inference_mode()
-    def propagate_in_video_preflight(self, inference_state, run_mem_encoder=True):
+    def _propagate_in_video_preflight_impl(
+        self, inference_state, run_mem_encoder=True
+    ):
         """Prepare inference_state and consolidate temporary outputs before tracking."""
         # Tracking has started and we don't allow adding new objects until session is reset.
         inference_state["tracking_has_started"] = True
@@ -757,6 +836,19 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 output_dict["cond_frame_outputs"], default=None
             )
 
+    @torch.inference_mode()
+    def propagate_in_video_preflight(self, inference_state, run_mem_encoder=True):
+        return self._propagate_in_video_preflight_impl(
+            inference_state, run_mem_encoder=run_mem_encoder
+        )
+
+    def propagate_in_video_preflight_for_training(
+        self, inference_state, run_mem_encoder=True
+    ):
+        return self._propagate_in_video_preflight_impl(
+            inference_state, run_mem_encoder=run_mem_encoder
+        )
+
     def _get_processing_order(
         self, inference_state, start_frame_idx, max_frame_num_to_track, reverse
     ):
@@ -787,8 +879,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             processing_order = range(start_frame_idx, end_frame_idx + 1)
         return processing_order
 
-    @torch.inference_mode()
-    def propagate_in_video(
+    def _propagate_in_video_impl(
         self,
         inference_state,
         start_frame_idx,
@@ -872,6 +963,51 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 inference_state, pred_masks
             )
             yield frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores
+
+    @torch.inference_mode()
+    def propagate_in_video(
+        self,
+        inference_state,
+        start_frame_idx,
+        max_frame_num_to_track,
+        reverse,
+        tqdm_disable=False,
+        obj_ids=None,
+        run_mem_encoder=True,
+        propagate_preflight=False,
+    ):
+        yield from self._propagate_in_video_impl(
+            inference_state=inference_state,
+            start_frame_idx=start_frame_idx,
+            max_frame_num_to_track=max_frame_num_to_track,
+            reverse=reverse,
+            tqdm_disable=tqdm_disable,
+            obj_ids=obj_ids,
+            run_mem_encoder=run_mem_encoder,
+            propagate_preflight=propagate_preflight,
+        )
+
+    def propagate_in_video_for_training(
+        self,
+        inference_state,
+        start_frame_idx,
+        max_frame_num_to_track,
+        reverse,
+        tqdm_disable=False,
+        obj_ids=None,
+        run_mem_encoder=True,
+        propagate_preflight=False,
+    ):
+        yield from self._propagate_in_video_impl(
+            inference_state=inference_state,
+            start_frame_idx=start_frame_idx,
+            max_frame_num_to_track=max_frame_num_to_track,
+            reverse=reverse,
+            tqdm_disable=tqdm_disable,
+            obj_ids=obj_ids,
+            run_mem_encoder=run_mem_encoder,
+            propagate_preflight=propagate_preflight,
+        )
 
     def _add_output_per_object(
         self, inference_state, frame_idx, current_out, storage_key

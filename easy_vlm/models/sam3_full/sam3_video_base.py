@@ -210,6 +210,7 @@ class Sam3VideoBase(nn.Module):
                 reverse=reverse,
                 tracker_states_local=tracker_states_local,
                 tracker_metadata_prev=tracker_metadata_prev,
+                training_safe=return_raw_outputs,
             )
         )
 
@@ -231,6 +232,7 @@ class Sam3VideoBase(nn.Module):
                 tracker_metadata_prev=tracker_metadata_prev,
                 tracker_states_local=tracker_states_local,
                 is_image_only=is_image_only,
+                training_safe=return_raw_outputs,
             )
         )
 
@@ -251,6 +253,7 @@ class Sam3VideoBase(nn.Module):
             orig_vid_height=orig_vid_height,
             orig_vid_width=orig_vid_width,
             feature_cache=feature_cache,
+            training_safe=return_raw_outputs,
         )
 
         # Step 5: finally, build the outputs for this frame (it only needs to be done on GPU 0 since
@@ -431,6 +434,7 @@ class Sam3VideoBase(nn.Module):
         reverse: bool,
         tracker_states_local: List[Any],
         tracker_metadata_prev: Dict[str, npt.NDArray],
+        training_safe: bool = False,
     ):
         # Step 1: propagate the local SAM2 states to get the current frame's prediction
         # `low_res_masks_local` of the existing masklets on this GPU
@@ -438,7 +442,10 @@ class Sam3VideoBase(nn.Module):
         # - low_res_masks_local: Tensor -- (num_local_obj, H_mask, W_mask)
         obj_ids_local, low_res_masks_local, obj_scores_local = (
             self._propogate_tracker_one_frame_local_gpu(
-                tracker_states_local, frame_idx=frame_idx, reverse=reverse
+                tracker_states_local,
+                frame_idx=frame_idx,
+                reverse=reverse,
+                training_safe=training_safe,
             )
         )
 
@@ -484,6 +491,7 @@ class Sam3VideoBase(nn.Module):
         tracker_states_local: List[Any],
         tracker_metadata: Dict[str, npt.NDArray],
         tracker_obj_scores_global: Tensor,
+        training_safe: bool = False,
     ):
         # Recondition the masklets based on the new detections
         for trk_obj_id, det_idx in trk_id_to_max_iou_high_conf_det.items():
@@ -514,7 +522,12 @@ class Sam3VideoBase(nn.Module):
                     logger.debug(
                         f"Adding new mask for track {trk_obj_id} at frame {frame_idx}. Objects {inference_state['obj_ids']} are all reconditioned."
                     )
-                    self.tracker.add_new_mask(
+                    add_mask_fn = (
+                        self.tracker.add_new_mask_for_training
+                        if training_safe
+                        else self.tracker.add_new_mask
+                    )
+                    add_mask_fn(
                         inference_state=inference_state,
                         frame_idx=frame_idx,
                         obj_id=trk_obj_id,
@@ -523,9 +536,12 @@ class Sam3VideoBase(nn.Module):
                     reconditioned_states_idx.add(state_idx)
 
             for idx in reconditioned_states_idx:
-                self.tracker.propagate_in_video_preflight(
-                    tracker_states_local[idx], run_mem_encoder=True
+                preflight_fn = (
+                    self.tracker.propagate_in_video_preflight_for_training
+                    if training_safe
+                    else self.tracker.propagate_in_video_preflight
                 )
+                preflight_fn(tracker_states_local[idx], run_mem_encoder=True)
         return tracker_states_local
 
     def run_tracker_update_planning_phase(
@@ -539,6 +555,7 @@ class Sam3VideoBase(nn.Module):
         tracker_metadata_prev: Dict[str, npt.NDArray],
         tracker_states_local: List[Any],
         is_image_only: bool = False,
+        training_safe: bool = False,
     ):
         # initialize new metadata from previous metadata (its values will be updated later)
         tracker_metadata_new = {
@@ -760,6 +777,7 @@ class Sam3VideoBase(nn.Module):
                 tracker_states_local,
                 tracker_metadata_prev,
                 tracker_obj_scores_global,
+                training_safe=training_safe,
             )
 
         # Step 4: Run SAM2 memory encoder on the current frame's prediction masks
@@ -928,6 +946,7 @@ class Sam3VideoBase(nn.Module):
         orig_vid_height: int,
         orig_vid_width: int,
         feature_cache: Dict,
+        training_safe: bool = False,
     ):
         # initialize tracking scores with detection scores
         new_det_fa_inds: npt.NDArray = tracker_update_plan["new_det_fa_inds"]
@@ -952,6 +971,7 @@ class Sam3VideoBase(nn.Module):
                 orig_vid_height=orig_vid_height,
                 orig_vid_width=orig_vid_width,
                 feature_cache=feature_cache,
+                training_safe=training_safe,
             )
 
         # Step 2: remove from SAM2 inference states those objects removed by heuristics
@@ -1251,6 +1271,7 @@ class Sam3VideoBase(nn.Module):
         reverse: bool,
         # by default, we disable memory encoding until we gather all outputs
         run_mem_encoder: bool = False,
+        training_safe: bool = False,
     ):
         """
         inference_states: List of inference states, each state corresponds to a different set of objects.
@@ -1264,7 +1285,12 @@ class Sam3VideoBase(nn.Module):
 
             # propagate one frame
             num_frames_propagated = 0
-            for out in self.tracker.propagate_in_video(
+            propagate_fn = (
+                self.tracker.propagate_in_video_for_training
+                if training_safe
+                else self.tracker.propagate_in_video
+            )
+            for out in propagate_fn(
                 inference_state,
                 start_frame_idx=frame_idx,
                 # end_frame_idx = start_frame_idx + max_frame_num_to_track
@@ -1630,10 +1656,12 @@ class Sam3VideoBase(nn.Module):
                 continue
             # Get the local high-res masks and object score logits for this inference state
             end_idx_state = start_idx_state + num_obj_per_state
-            local_high_res_masks = high_res_masks[start_idx_state:end_idx_state]
+            # `high_res_masks` / `object_score_logits` can originate from inference-style
+            # tracking helpers; clone them here so autograd can safely save them for backward.
+            local_high_res_masks = high_res_masks[start_idx_state:end_idx_state].clone()
             local_object_score_logits = object_score_logits[
                 start_idx_state:end_idx_state
-            ]
+            ].clone()
             local_batch_size = local_high_res_masks.size(0)
             # Run Sam2 memory encoder. Note that we do not re-enforce the non-overlapping constraint as it is turned off by default
 
@@ -1677,6 +1705,7 @@ class Sam3VideoBase(nn.Module):
         orig_vid_height: int,
         orig_vid_width: int,
         feature_cache: Dict,
+        training_safe: bool = False,
     ):
         """Add a new object to SAM2 inference states."""
         prev_tracker_state = (
@@ -1686,7 +1715,12 @@ class Sam3VideoBase(nn.Module):
         # prepare inference_state
         # batch objects that first appear on the same frame together
         # Clear inference state. Keep the cached image features if available.
-        new_tracker_state = self.tracker.init_state(
+        init_state_fn = (
+            self.tracker.init_state_for_training
+            if training_safe
+            else self.tracker.init_state
+        )
+        new_tracker_state = init_state_fn(
             cached_features=feature_cache,
             video_height=orig_vid_height,
             video_width=orig_vid_width,
@@ -1711,7 +1745,12 @@ class Sam3VideoBase(nn.Module):
 
         # add object one by one
         for new_obj_id, new_mask in zip(new_obj_ids, new_obj_masks):
-            self.tracker.add_new_mask(
+            add_mask_fn = (
+                self.tracker.add_new_mask_for_training
+                if training_safe
+                else self.tracker.add_new_mask
+            )
+            add_mask_fn(
                 inference_state=new_tracker_state,
                 frame_idx=frame_idx,
                 obj_id=new_obj_id,
@@ -1719,9 +1758,12 @@ class Sam3VideoBase(nn.Module):
                 add_mask_to_memory=True,
             )
         # NOTE: we skip enforcing the non-overlapping constraint **globally** when adding new objects.
-        self.tracker.propagate_in_video_preflight(
-            new_tracker_state, run_mem_encoder=True
+        preflight_fn = (
+            self.tracker.propagate_in_video_preflight_for_training
+            if training_safe
+            else self.tracker.propagate_in_video_preflight
         )
+        preflight_fn(new_tracker_state, run_mem_encoder=True)
         tracker_states_local.append(new_tracker_state)
         return tracker_states_local
 

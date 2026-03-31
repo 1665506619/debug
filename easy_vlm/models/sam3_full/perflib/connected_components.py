@@ -32,6 +32,10 @@ def connected_components_cpu(input_tensor: torch.Tensor):
     else:
         assert input_tensor.dim() == 3, "Input tensor must be (B, H, W) or (B, 1, H, W)."
 
+    if input_tensor.shape[0] == 0:
+        empty = torch.zeros(out_shape, device=input_tensor.device, dtype=torch.int64)
+        return empty, empty.clone()
+
     labels_list = []
     counts_list = []
     for b in range(input_tensor.shape[0]):
