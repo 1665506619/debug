@@ -456,7 +456,9 @@ class Attention(nn.Module):
             cls_freqs_cis = torch.polar(torch.ones_like(t), t)[None, :]
             freqs_cis = torch.cat([cls_freqs_cis, freqs_cis], dim=0)
 
-        self.register_buffer("freqs_cis", freqs_cis)
+        # RoPE cache: derive it from geometry at runtime instead of checkpointing a
+        # complex64 buffer that safetensors cannot serialize.
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
     def _apply_rope(self, q, k) -> Tuple[Tensor, Tensor]:
         if not self.use_rope:
