@@ -282,11 +282,11 @@ class SegmentationDecoder(nn.Module):
             self.config, "grounding_num_queries", self.config.max_seg_nums
         )
         if config.seg_encoder == "sam3" and config.seg_decoder == "sam3":
-            checkpoint_path = _resolve_sam3_checkpoint_path(
-                getattr(self.config, "mask_decoder_model", None)
-            )
+            # Build the SAM3 branch structure here, but defer loading the external
+            # SAM3 checkpoint until after HF/Transformers finishes materializing the
+            # parent model. Loading into meta parameters here becomes a no-op.
             self.model = _build_sam3_full_image_model(
-                checkpoint_path=checkpoint_path,
+                checkpoint_path=None,
                 training=self.training,
                 num_queries=grounding_num_queries,
             )
