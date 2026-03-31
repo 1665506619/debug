@@ -10,13 +10,24 @@ from PIL import Image
 from transformers.image_utils import load_image
 from transformers.video_utils import VideoMetadata
 
-from ..training.utils import get_args, get_encoder_load_balancing_group
 from torch import Tensor
 import logging
 from huggingface_hub import hf_hub_download
 import functools
 
 logger = logging.getLogger(__name__)
+
+
+def _get_training_args():
+    from ..training.utils import get_args
+
+    return get_args()
+
+
+def _get_encoder_load_balancing_group():
+    from ..training.utils import get_encoder_load_balancing_group
+
+    return get_encoder_load_balancing_group()
 
 
 def _sort_frame_paths_numerically(frame_paths: List[str]) -> List[str]:
@@ -329,7 +340,7 @@ def cross_entropy_loss(
     num_items_in_batch,
     **kwargs,
 ):
-    training_args = get_args()
+    training_args = _get_training_args()
     batch_size = hidden_states.size(0)
 
     shift_hidden_states = hidden_states[..., :-1, :]
@@ -468,9 +479,11 @@ class EncoderLoadBalancingHandler(object):
         grid_thw: torch.Tensor,
         merge_size: int = 1,
     ):
-        self.group = get_encoder_load_balancing_group()
+        self.group = _get_encoder_load_balancing_group()
 
-        self._activated = self.group is not None and get_args().encoder_load_balancing
+        self._activated = (
+            self.group is not None and _get_training_args().encoder_load_balancing
+        )
         self.cu_seqlens = None
         if not self._activated:
             return
