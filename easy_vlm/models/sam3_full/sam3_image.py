@@ -904,7 +904,6 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             "pred_boxes": out_local["pred_boxes"],
             "pred_boxes_xyxy": out_local["pred_boxes_xyxy"],
             "pred_masks": out_local["pred_masks"],
-            "queries": out_local["queries"],
         }
 
         # gather the results: after this step, each GPU will receive detector outputs on

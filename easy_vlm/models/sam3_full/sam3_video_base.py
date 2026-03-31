@@ -403,7 +403,6 @@ class Sam3VideoBase(nn.Module):
             "score_logits": sam3_image_out["pred_logits"].squeeze(-1)[
                 pos_pred_idx[0], pos_pred_idx[1]
             ],
-            "query_feats": sam3_image_out["queries"][pos_pred_idx[0], pos_pred_idx[1]],
         }
 
         # Step 3: build SAM2 backbone features and store them in `feature_cache`
@@ -1083,7 +1082,6 @@ class Sam3VideoBase(nn.Module):
         obj_ids = []
         mask_logits = []
         score_probs = []
-        query_feats = []
 
         existing_masklet_obj_ids = tracker_metadata_prev["obj_ids_all_gpu"]
         if tracker_low_res_masks_global.shape[0] > 0:
@@ -1098,16 +1096,6 @@ class Sam3VideoBase(nn.Module):
             obj_ids.extend(existing_masklet_obj_ids.tolist())
             mask_logits.append(existing_masklet_video_res_masks)
             score_probs.append(existing_scores)
-            query_feat_dim = det_out["query_feats"].shape[-1] if det_out["query_feats"].numel() > 0 else 0
-            if query_feat_dim > 0:
-                query_feats.append(
-                    torch.zeros(
-                        tracker_low_res_masks_global.shape[0],
-                        query_feat_dim,
-                        device=existing_masklet_video_res_masks.device,
-                        dtype=det_out["query_feats"].dtype,
-                    )
-                )
 
         if len(new_det_obj_ids) > 0:
             new_det_fa_inds_t = torch.as_tensor(
@@ -1133,7 +1121,6 @@ class Sam3VideoBase(nn.Module):
             obj_ids.extend(new_det_obj_ids.tolist())
             mask_logits.append(new_masklet_video_res_masks)
             score_probs.append(new_det_scores)
-            query_feats.append(det_out["query_feats"][new_det_fa_inds_t])
 
         if len(obj_ids) == 0:
             empty_masks = torch.zeros(
@@ -1156,12 +1143,6 @@ class Sam3VideoBase(nn.Module):
                 "pred_mask_logits": empty_masks,
                 "out_probs": empty_scores,
                 "out_score_logits": empty_score_logits,
-                "candidate_query_feats": torch.zeros(
-                    0,
-                    0,
-                    device=device,
-                    dtype=det_out["score_logits"].dtype,
-                ),
             }
 
         pred_mask_logits = torch.cat(mask_logits, dim=0)
@@ -1173,11 +1154,6 @@ class Sam3VideoBase(nn.Module):
             out_score_logits_list.append(det_out["score_logits"][new_det_fa_inds_t])
         out_score_logits = torch.cat(out_score_logits_list, dim=0)
         out_obj_ids = torch.tensor(obj_ids, dtype=torch.long, device=pred_mask_logits.device)
-        candidate_query_feats = (
-            torch.cat(query_feats, dim=0)
-            if len(query_feats) > 0
-            else torch.zeros(0, 0, device=pred_mask_logits.device, dtype=out_score_logits.dtype)
-        )
 
         if reconditioned_obj_ids:
             trk_id_to_max_iou_high_conf_det = tracker_update_plan.get(
@@ -1204,7 +1180,6 @@ class Sam3VideoBase(nn.Module):
             "pred_mask_logits": pred_mask_logits,
             "out_probs": out_probs,
             "out_score_logits": out_score_logits,
-            "candidate_query_feats": candidate_query_feats,
         }
 
     def _get_objects_to_suppress_based_on_most_recently_occluded(

@@ -247,6 +247,7 @@ class DataCollator(object):
         batch["mask_ids"] = [x["mask_ids"] for x in instances]
         batch["modalities"] = [x["sample_modality"] for x in instances]
         batch["seg_phrases"] = [x.get("seg_phrases", []) for x in instances]
+        batch["sample_infos"] = [x.get("sample_info") for x in instances]
         batch["video_sam_frames"] = [x.get("video_sam_frames") for x in instances]
         batch["video_clip_masks"] = [x.get("video_clip_masks") for x in instances]
         batch["video_clip_mask_valid"] = [x.get("video_clip_mask_valid") for x in instances]
@@ -324,6 +325,7 @@ class DataCollator(object):
         batch["mask_ids"] = [x["mask_ids"] for x in instances]
         batch["modalities"] = [x["sample_modality"] for x in instances]
         batch["seg_phrases"] = [x.get("seg_phrases", []) for x in instances]
+        batch["sample_infos"] = [x.get("sample_info") for x in instances]
         batch["video_sam_frames"] = [x.get("video_sam_frames") for x in instances]
         batch["video_clip_masks"] = [x.get("video_clip_masks") for x in instances]
         batch["video_clip_mask_valid"] = [x.get("video_clip_mask_valid") for x in instances]
@@ -640,6 +642,28 @@ class SFTDataset(Dataset):
 
     def _is_video_file(self, path):
         return isinstance(path, str) and path.lower().endswith(VIDEO_FILE_EXTS)
+
+    def _build_sample_info(self, raw_data_dict, index):
+        sample_info = {"data_index": index}
+        keys_to_copy = [
+            "source",
+            "source_dataset",
+            "video_id",
+            "anno_ids",
+            "expression",
+            "image",
+            "video",
+        ]
+        for key in keys_to_copy:
+            value = raw_data_dict.get(key)
+            if value is None:
+                continue
+            if key == "video" and isinstance(value, list):
+                sample_info["video_len"] = len(value)
+                sample_info["video_preview"] = value[:3]
+                continue
+            sample_info[key] = value
+        return sample_info
 
     def _to_pil_image(self, image):
         if isinstance(image, Image.Image):
@@ -1520,14 +1544,16 @@ class SFTDataset(Dataset):
         return model_inputs
 
     def __getitem__(self, index) -> Dict[str, torch.Tensor]:
-        image_path = self._dataset[index].get('image', None)
+        raw_data_dict = self._dataset[index]
+        image_path = raw_data_dict.get('image', None)
         if image_path is not None and 'objects365_v2_01808559.jpg' in image_path:
             backup_idx = random.randint(0, len(self) - 1)
             print(f"Encounted error when process {index}-th example, use {backup_idx}-th example instead!!!")
             return self.__getitem__(backup_idx)
         try:
-            data_dict = self._preprocess(self._dataset[index])
+            data_dict = self._preprocess(raw_data_dict)
             data_dict["data_index"] = index
+            data_dict["sample_info"] = self._build_sample_info(raw_data_dict, index)
         except Exception:
             traceback.print_exc()
             backup_idx = random.randint(0, len(self) - 1)

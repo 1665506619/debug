@@ -44,6 +44,7 @@ WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
 WARMUP_RATIO=${WARMUP_RATIO:-0.03}
 LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-cosine}
 REPORT_TO=${REPORT_TO:-none}
+BADCASE_LOG_PATH=${BADCASE_LOG_PATH:-${OUTPUT_DIR}/badcases.jsonl}
 
 mkdir -p "$(dirname "${TRAIN_JSON}")" "${OUTPUT_DIR}"
 
@@ -72,6 +73,7 @@ fi
 set -x
 
 export OMP_NUM_THREADS
+export BADCASE_LOG_PATH
 
 "${TORCHRUN_BIN}" \
   --nnodes "${NNODES}" \
