@@ -165,7 +165,74 @@ def _patch_geometry_encoder_dtype_compat(geometry_encoder):
     return geometry_encoder
 
 
-def _build_sam3_full_image_model(checkpoint_path, training):
+def _create_sam3_full_transformer(num_queries):
+    import pkg_resources
+    from sam3 import model_builder as sam3_builder
+    from sam3.model.decoder import TransformerDecoder, TransformerDecoderLayer
+    from sam3.model.model_misc import MultiheadAttentionWrapper as MultiheadAttention
+    from sam3.model.model_misc import TransformerWrapper
+
+    if num_queries <= 0:
+        raise ValueError(f"num_queries must be positive, got {num_queries}")
+
+    encoder = sam3_builder._create_transformer_encoder()
+
+    decoder_layer = TransformerDecoderLayer(
+        activation="relu",
+        d_model=256,
+        dim_feedforward=2048,
+        dropout=0.1,
+        cross_attention=MultiheadAttention(
+            num_heads=8,
+            dropout=0.1,
+            embed_dim=256,
+        ),
+        n_heads=8,
+        use_text_cross_attention=True,
+    )
+
+    decoder = TransformerDecoder(
+        layer=decoder_layer,
+        num_layers=6,
+        num_queries=num_queries,
+        return_intermediate=True,
+        box_refine=True,
+        num_o2m_queries=0,
+        dac=True,
+        boxRPB="log",
+        d_model=256,
+        frozen=False,
+        interaction_layer=None,
+        dac_use_selfatt_ln=True,
+        resolution=1008,
+        stride=14,
+        use_act_checkpoint=True,
+        presence_token=True,
+    )
+    return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
+
+
+def _load_sam3_full_checkpoint(model, checkpoint_path):
+    from iopath.common.file_io import g_pathmgr
+
+    with g_pathmgr.open(checkpoint_path, "rb") as f:
+        ckpt = torch.load(f, map_location="cpu", weights_only=True)
+    if "model" in ckpt and isinstance(ckpt["model"], dict):
+        ckpt = ckpt["model"]
+
+    sam3_image_ckpt = {
+        k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
+    }
+    for key in [
+        "transformer.decoder.query_embed.weight",
+        "transformer.decoder.reference_points.weight",
+    ]:
+        sam3_image_ckpt.pop(key, None)
+
+    model.load_state_dict(sam3_image_ckpt, strict=False)
+
+
+def _build_sam3_full_image_model(checkpoint_path, training, num_queries):
     import pkg_resources
     from sam3 import model_builder as sam3_builder
 
@@ -179,7 +246,7 @@ def _build_sam3_full_image_model(checkpoint_path, training):
     )
     text_encoder = sam3_builder._create_text_encoder(bpe_path)
     backbone = sam3_builder._create_vl_backbone(vision_encoder, text_encoder)
-    transformer = sam3_builder._create_sam3_transformer()
+    transformer = _create_sam3_full_transformer(num_queries)
     dot_prod_scoring = sam3_builder._create_dot_product_scoring()
     segmentation_head = sam3_builder._create_segmentation_head(compile_mode=None)
     input_geometry_encoder = sam3_builder._create_geometry_encoder()
@@ -200,7 +267,7 @@ def _build_sam3_full_image_model(checkpoint_path, training):
     )
 
     if checkpoint_path is not None:
-        sam3_builder._load_checkpoint(model, checkpoint_path)
+        _load_sam3_full_checkpoint(model, checkpoint_path)
 
     if training:
         model.train()
@@ -220,6 +287,7 @@ class SegmentationDecoder(nn.Module):
             self.model = _build_sam3_full_image_model(
                 checkpoint_path=checkpoint_path,
                 training=self.training,
+                num_queries=self.config.max_seg_nums,
             )
         else:
             raise NotImplementedError
@@ -237,6 +305,7 @@ class SegmentationDecoder(nn.Module):
         self.model = _build_sam3_full_image_model(
             checkpoint_path=checkpoint_path,
             training=self.training,
+            num_queries=config.max_seg_nums,
         )
 
     def get_sam_model(self):

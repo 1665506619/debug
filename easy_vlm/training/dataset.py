@@ -17,7 +17,7 @@ from transformers import ProcessorMixin, logging, PretrainedConfig
 from .utils import rank0_print, SEG_IMAGE_QUESTIONS_PHRASE, SEG_VIDEO_QUESTIONS_PHRASE, SEG_IMAGE_QUESTIONS_OCR, SEG_IMAGE_QUESTIONS_PHRASE_MULTI
 from .mm_utils import annToMask, resize_nearest_like_torch, iou_mask
 from ..constants import SEG_TOKEN, REF_START_TOKEN, REF_END_TOKEN, SEG_START_TOKEN, SEG_END_TOKEN, IGNORE_INDEX, MAX_PHRASE_NUM, MAX_OBJ_NUM
-from ..models.utils import load_video
+from ..models.utils import load_video, _sort_frame_paths_numerically
 
 logger = logging.get_logger(__name__)
 
@@ -712,7 +712,7 @@ class SFTDataset(Dataset):
                 sampled_paths = [None] * len(sampled_indices)
                 frame_candidates = [sampled_indices[0], str(sampled_indices[0])]
             elif os.path.isdir(video_path):
-                frame_files = sorted(
+                frame_files = _sort_frame_paths_numerically(
                     [
                         os.path.join(video_path, frame_file)
                         for frame_file in os.listdir(video_path)
