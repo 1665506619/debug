@@ -745,7 +745,12 @@ class ViT(nn.Module):
             self.pos_embed = None
 
         # stochastic depth decay rule
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        # Avoid tensor.item() here so ViT construction remains safe under
+        # transformers/meta init contexts during distributed model loading.
+        if depth <= 1:
+            dpr = [float(drop_path_rate)] if depth == 1 else []
+        else:
+            dpr = [float(drop_path_rate) * i / float(depth - 1) for i in range(depth)]
 
         self.blocks = nn.ModuleList()
         cur_stage = 1
