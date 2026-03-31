@@ -2,10 +2,12 @@ from . import qwen3_vl
 
 try:
     from . import video_llama_3
-except Exception:
+except Exception as exc:
     import warnings
 
-    warnings.warn("Fail to import `VideoLlama3` implementation from `transformers`.")
+    warnings.warn(
+        f"Fail to import `VideoLlama3` implementation from `transformers`: {exc}"
+    )
 import torch
 import os
 import json
